@@ -1,0 +1,4242 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk, colorchooser
+from tkinter.scrolledtext import ScrolledText
+from PIL import Image, ImageTk, ImageGrab, ImageDraw
+import tempfile
+import shutil
+import os
+import sys
+import re
+from threading import Thread, Lock
+from datetime import datetime
+from xml.sax.saxutils import escape as xml_escape
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.utils import ImageReader
+from reportlab.platypus import BaseDocTemplate, PageTemplate, Frame, Paragraph, Spacer, Image as RLImage, PageBreak, Flowable, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
+from reportlab.lib import colors
+
+
+class _PreviewSourceMarker(Flowable):
+    """Zero-size marker used to map editor content to the actual PDF page."""
+    def __init__(self, source):
+        super().__init__()
+        self.source = dict(source)
+        self.width = 0
+        self.height = 0
+
+    def wrap(self, availWidth, availHeight):
+        return 0, 0
+
+    def draw(self):
+        pass
+
+
+class _SourceParagraph(Paragraph):
+    """Paragraph that carries its editor source through pagination/splitting."""
+    def __init__(self, text, style, source=None, **kwargs):
+        super().__init__(text, style, **kwargs)
+        self._preview_source = dict(source or {})
+
+    def split(self, availWidth, availHeight):
+        parts = super().split(availWidth, availHeight)
+        for part in parts:
+            part._preview_source = dict(self._preview_source)
+        return parts
+
+
+class _SourceTrackingDocTemplate(BaseDocTemplate):
+    """Collect source markers using ReportLab's real page layout."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.page_sources = {}
+
+    def afterFlowable(self, flowable):
+        source = None
+        if isinstance(flowable, _PreviewSourceMarker):
+            source = flowable.source
+        else:
+            source = getattr(flowable, "_preview_source", None)
+
+        if source:
+            sources = self.page_sources.setdefault(self.page, [])
+            source = dict(source)
+            if source not in sources:
+                sources.append(source)
+
+
+def resource_path(relpath):
+    if hasattr(sys, "_MEIPASS"):
+        return os.path.join(sys._MEIPASS, relpath)
+    return os.path.abspath(relpath)
+
+
+POPPLER_PATH = resource_path("poppler/bin")
+if not os.path.exists(POPPLER_PATH):
+    POPPLER_PATH = None
+
+try:
+    import pdfplumber
+except ImportError:
+    messagebox.showerror("Missing pdfplumber", "Please install pdfplumber:\npip install pdfplumber")
+    raise
+
+try:
+    from docx2pdf import convert as docx2pdf_convert
+    DOCX2PDF_AVAILABLE = True
+except ImportError:
+    DOCX2PDF_AVAILABLE = False
+
+try:
+    from pdf2image import convert_from_path
+    PDF2IMAGE_AVAILABLE = True
+except ImportError:
+    PDF2IMAGE_AVAILABLE = False
+
+
+def is_garbage(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return True
+    if "cid:" in s or "(cid:" in s or "cid)" in s:
+        return True
+    if re.fullmatch(r"[\W_]+", s):
+        return True
+    if re.fullmatch(r"(cid:\d+\s*)+", s):
+        return True
+    if s.count("cid:") >= 2 and all(x in "\n\t " or x.isdigit() for x in s.replace("cid:", "").replace("(", "").replace(")", "")):
+        return True
+    if len([x for x in s if x not in "\n 0123456789()-cid:"]) == 0 and len(s) > 0:
+        return True
+    if len(re.findall(r"[a-zA-Z0-9\u0900-\u097F]", s)) <= 2:
+        return True
+    segs = s.split()
+    if segs and all(seg.startswith("cid:") or set(seg) <= set("()0123456789") for seg in segs):
+        return True
+    return False
+
+
+PAGE_NUM_REGEXES = [
+    re.compile(r"^\d+$"),
+    re.compile(r"^page\s+\d+$", re.IGNORECASE),
+    re.compile(r"^page\s+\d+\s+of\s+\d+$", re.IGNORECASE),
+    re.compile(r"^\d+\s*/\s*\d+$"),
+]
+
+
+def is_probable_page_number(line: str) -> bool:
+    s = line.strip()
+    for rg in PAGE_NUM_REGEXES:
+        if rg.match(s):
+            return True
+    return False
+
+
+class ArchiveDialog(tk.Toplevel):
+    def __init__(self, parent, archive_entries):
+        super().__init__(parent)
+        self.title("Image Archive")
+        self.configure(bg="#23242e")
+        self.geometry("520x420")
+        self.parent = parent
+        self.entries = archive_entries
+        self.result = None
+
+        main = tk.Frame(self, bg="#23242e")
+        main.pack(fill="both", expand=True, padx=10, pady=10)
+
+        tk.Label(main, text="Select page to reupload", bg="#23242e", fg="white", font=("Arial", 11, "bold")).pack(anchor="w", pady=(0, 5))
+
+        list_frame = tk.Frame(main, bg="#23242e")
+        list_frame.pack(fill="both", expand=True)
+
+        self.listbox = tk.Listbox(list_frame, selectmode="single")
+        self.listbox.pack(side="left", fill="both", expand=True)
+
+        scrollbar = tk.Scrollbar(list_frame, orient="vertical", command=self.listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.listbox.config(yscrollcommand=scrollbar.set)
+
+        for idx, entry in enumerate(self.entries):
+            line = entry["line"]
+            title = entry["title"] or "(no title)"
+            title_short = title[:60] + "..." if len(title) > 60 else title
+            self.listbox.insert("end", f"{idx + 1}. Line {line} - {title_short}")
+
+        btn_frame = tk.Frame(main, bg="#23242e")
+        btn_frame.pack(fill="x", pady=(8, 0))
+
+        tk.Button(btn_frame, text="OK", command=self.on_ok, bg="#006bce", fg="white", width=8).pack(side="left", padx=5)
+        tk.Button(btn_frame, text="Cancel", command=self.on_cancel, bg="#c0342c", fg="white", width=8).pack(side="right", padx=5)
+
+        self.transient(parent)
+        self.grab_set()
+        self.listbox.focus_set()
+
+    def on_ok(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            return
+        self.result = self.entries[sel[0]]
+        self.destroy()
+
+    def on_cancel(self):
+        self.result = None
+        self.destroy()
+
+
+class ReuploadPageSelector(tk.Toplevel):
+    """Visual selector for an existing pasted page/image.
+
+    This is intentionally isolated to the re-upload workflow. It does not
+    change the underlying image archive or editor records until the user
+    confirms a replacement.
+    """
+    def __init__(self, parent, entries, source_getter):
+        super().__init__(parent)
+        self.parent = parent
+        self.entries = list(entries)
+        self.source_getter = source_getter
+        self.result = None
+        self.thumb_refs = []
+        self.preview_ref = None
+        self.selected_index = None
+
+        self.title("Reupload Page - Select Exact Page")
+        self.geometry("1120x720")
+        self.minsize(900, 600)
+        self.configure(bg="#23242e")
+
+        header = tk.Frame(self, bg="#23242e")
+        header.pack(fill="x", padx=12, pady=(10, 5))
+        tk.Label(
+            header, text="Select the exact page you want to re-upload",
+            bg="#23242e", fg="white", font=("Arial", 13, "bold")
+        ).pack(side="left")
+        tk.Label(
+            header, text="Click a thumbnail to see a large preview",
+            bg="#23242e", fg="#b8bcc8", font=("Arial", 9)
+        ).pack(side="left", padx=15)
+
+        search_frame = tk.Frame(self, bg="#23242e")
+        search_frame.pack(fill="x", padx=12, pady=(0, 8))
+        tk.Label(search_frame, text="Search:", bg="#23242e", fg="white").pack(side="left")
+        self.search_var = tk.StringVar()
+        search = tk.Entry(search_frame, textvariable=self.search_var, width=38)
+        search.pack(side="left", padx=7)
+        search.bind("<KeyRelease>", lambda e: self._rebuild_cards())
+        tk.Button(
+            search_frame, text="Clear", command=lambda: self.search_var.set("") or self._rebuild_cards(),
+            bg="#4b5563", fg="white"
+        ).pack(side="left")
+
+        body = tk.Frame(self, bg="#23242e")
+        body.pack(fill="both", expand=True, padx=12, pady=5)
+
+        # Left: scrollable thumbnail grid.
+        left = tk.Frame(body, bg="#1d1e27", bd=1, relief="solid")
+        left.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        self.canvas = tk.Canvas(left, bg="#1d1e27", highlightthickness=0)
+        self.scrollbar = tk.Scrollbar(left, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.scrollbar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.grid_frame = tk.Frame(self.canvas, bg="#1d1e27")
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.grid_frame, anchor="nw")
+        self.grid_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", self._resize_inner)
+        self.canvas.bind_all("<MouseWheel>", self._mousewheel, add="+")
+
+        # Right: large preview.
+        right = tk.Frame(body, bg="#1d1e27", bd=1, relief="solid", width=390)
+        right.pack(side="right", fill="y")
+        right.pack_propagate(False)
+        tk.Label(right, text="Selected Page Preview", bg="#1d1e27", fg="white", font=("Arial", 11, "bold")).pack(pady=(12, 6))
+        self.preview_label = tk.Label(right, bg="#111218", fg="#9ca3af", text="Select a page")
+        self.preview_label.pack(fill="both", expand=True, padx=12, pady=8)
+        self.info_var = tk.StringVar(value="No page selected")
+        tk.Label(right, textvariable=self.info_var, justify="left", anchor="w", wraplength=350,
+                 bg="#1d1e27", fg="#d8dbe3", font=("Arial", 9)).pack(fill="x", padx=12, pady=8)
+
+        btns = tk.Frame(self, bg="#23242e")
+        btns.pack(fill="x", padx=12, pady=(5, 12))
+        tk.Button(btns, text="Select This Page", command=self.on_select, bg="#006bce", fg="white", width=18).pack(side="left", padx=5)
+        tk.Button(btns, text="Cancel", command=self.on_cancel, bg="#c0342c", fg="white", width=12).pack(side="right", padx=5)
+
+        self._rebuild_cards()
+        self.transient(parent)
+        self.grab_set()
+        self.focus_force()
+
+    def _resize_inner(self, event):
+        try:
+            self.canvas.itemconfigure(self.canvas_window, width=max(event.width - 4, 1))
+        except Exception:
+            pass
+
+    def _mousewheel(self, event):
+        try:
+            if self.winfo_exists():
+                self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        except Exception:
+            pass
+
+    def _filtered(self):
+        q = self.search_var.get().strip().lower()
+        if not q:
+            return list(enumerate(self.entries))
+        out = []
+        for idx, entry in enumerate(self.entries):
+            source = self.source_getter(entry)
+            hay = " ".join([
+                str(idx + 1), str(entry.get("line", "")),
+                str(entry.get("title", "")), str(source.get("label", "")),
+                str(source.get("detail", ""))
+            ]).lower()
+            if q in hay:
+                out.append((idx, entry))
+        return out
+
+    def _make_thumb(self, img, max_w=145, max_h=145):
+        thumb = img.copy()
+        thumb.thumbnail((max_w, max_h), Image.LANCZOS)
+        return ImageTk.PhotoImage(thumb)
+
+    def _rebuild_cards(self):
+        for child in self.grid_frame.winfo_children():
+            child.destroy()
+        self.thumb_refs = []
+        filtered = self._filtered()
+        if not filtered:
+            tk.Label(self.grid_frame, text="No matching pages", bg="#1d1e27", fg="#cbd5e1",
+                     font=("Arial", 11)).grid(row=0, column=0, padx=30, pady=30)
+            return
+
+        columns = 3
+        for pos, (idx, entry) in enumerate(filtered):
+            card = tk.Frame(self.grid_frame, bg="#292b36", bd=1, relief="solid", cursor="hand2")
+            row, col = divmod(pos, columns)
+            card.grid(row=row, column=col, padx=8, pady=8, sticky="nsew")
+            img = entry.get("img")
+            if img is not None:
+                ph = self._make_thumb(img)
+                self.thumb_refs.append(ph)
+                lbl = tk.Label(card, image=ph, bg="#111218")
+                lbl.pack(padx=8, pady=8)
+            source = self.source_getter(entry)
+            title = entry.get("title") or "(no nearby text)"
+            if len(title) > 34:
+                title = title[:34] + "..."
+            text = f"Page {idx + 1}  |  Line {entry.get('line')}\n{source.get('label', 'Image')}\n{title}"
+            info = tk.Label(card, text=text, bg="#292b36", fg="white", justify="left", wraplength=175,
+                            font=("Arial", 8, "bold"))
+            info.pack(fill="x", padx=8, pady=(0, 8))
+            for widget in (card, lbl, info):
+                widget.bind("<Button-1>", lambda e, i=idx: self._select(i))
+                widget.bind("<Double-Button-1>", lambda e, i=idx: self._select_and_accept(i))
+
+        for c in range(columns):
+            self.grid_frame.grid_columnconfigure(c, weight=1)
+
+    def _select(self, idx):
+        if idx < 0 or idx >= len(self.entries):
+            return
+        self.selected_index = idx
+        entry = self.entries[idx]
+        img = entry.get("img")
+        if img is not None:
+            preview = img.copy()
+            preview.thumbnail((350, 440), Image.LANCZOS)
+            self.preview_ref = ImageTk.PhotoImage(preview)
+            self.preview_label.configure(image=self.preview_ref, text="")
+        source = self.source_getter(entry)
+        title = entry.get("title") or "(no nearby text)"
+        self.info_var.set(
+            f"Page: {idx + 1}\n"
+            f"Editor line: {entry.get('line')}\n"
+            f"Source: {source.get('label', 'Image')}\n"
+            f"{source.get('detail', '')}\n"
+            f"Context: {title}"
+        )
+
+    def _select_and_accept(self, idx):
+        self._select(idx)
+        self.on_select()
+
+    def on_select(self):
+        if self.selected_index is None:
+            messagebox.showinfo("Select Page", "Please click the exact page you want to re-upload.", parent=self)
+            return
+        self.result = self.entries[self.selected_index]
+        self.destroy()
+
+    def on_cancel(self):
+        self.result = None
+        self.destroy()
+
+
+class ReuploadPDFPageSelector(tk.Toplevel):
+    """Visual selector for one exact slide/page from a replacement PDF."""
+    def __init__(self, parent, pdf_path):
+        super().__init__(parent)
+        self.parent = parent
+        self.pdf_path = pdf_path
+        self.result = None
+        self.images = []
+        self.refs = []
+        self.selected = None
+        self.title("Select Replacement PDF Slide")
+        self.geometry("1050x700")
+        self.configure(bg="#23242e")
+
+        tk.Label(self, text=f"Select the exact PDF slide to replace the old page",
+                 bg="#23242e", fg="white", font=("Arial", 12, "bold")).pack(anchor="w", padx=12, pady=(10, 2))
+        tk.Label(self, text=os.path.basename(pdf_path), bg="#23242e", fg="#b8bcc8").pack(anchor="w", padx=12, pady=(0, 8))
+
+        body = tk.Frame(self, bg="#23242e")
+        body.pack(fill="both", expand=True, padx=12)
+        left = tk.Frame(body, bg="#1d1e27", bd=1, relief="solid")
+        left.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        canvas = tk.Canvas(left, bg="#1d1e27", highlightthickness=0)
+        sb = tk.Scrollbar(left, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        self.grid = tk.Frame(canvas, bg="#1d1e27")
+        win = canvas.create_window((0, 0), window=self.grid, anchor="nw")
+        self.grid.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=max(e.width - 4, 1)))
+
+        right = tk.Frame(body, bg="#1d1e27", width=360)
+        right.pack(side="right", fill="y")
+        right.pack_propagate(False)
+        tk.Label(right, text="Slide Preview", bg="#1d1e27", fg="white", font=("Arial", 11, "bold")).pack(pady=8)
+        self.preview = tk.Label(right, bg="#111218", fg="#9ca3af", text="Select a slide")
+        self.preview.pack(fill="both", expand=True, padx=10, pady=8)
+        self.info = tk.StringVar(value="No slide selected")
+        tk.Label(right, textvariable=self.info, bg="#1d1e27", fg="#d8dbe3", justify="left", anchor="w").pack(fill="x", padx=10, pady=8)
+
+        btn = tk.Frame(self, bg="#23242e")
+        btn.pack(fill="x", padx=12, pady=10)
+        tk.Button(btn, text="Use This Slide", command=self.on_ok, bg="#006bce", fg="white", width=16).pack(side="left", padx=5)
+        tk.Button(btn, text="Cancel", command=self.on_cancel, bg="#c0342c", fg="white", width=12).pack(side="right", padx=5)
+
+        self._load_pdf()
+        self.transient(parent)
+        self.grab_set()
+
+    def _load_pdf(self):
+        try:
+            import pdfplumber
+            with pdfplumber.open(self.pdf_path) as pdf:
+                for page_no, page in enumerate(pdf.pages, start=1):
+                    img = page.to_image(resolution=90).original.convert("RGB")
+                    self.images.append((page_no, img))
+                    thumb = img.copy()
+                    thumb.thumbnail((145, 145), Image.LANCZOS)
+                    ref = ImageTk.PhotoImage(thumb)
+                    self.refs.append(ref)
+                    card = tk.Frame(self.grid, bg="#292b36", bd=1, relief="solid", cursor="hand2")
+                    row, col = divmod(page_no - 1, 3)
+                    card.grid(row=row, column=col, padx=8, pady=8, sticky="nsew")
+                    lbl = tk.Label(card, image=ref, bg="#111218")
+                    lbl.pack(padx=8, pady=8)
+                    txt = tk.Label(card, text=f"PDF Slide {page_no}", bg="#292b36", fg="white", font=("Arial", 9, "bold"))
+                    txt.pack(pady=(0, 8))
+                    for w in (card, lbl, txt):
+                        w.bind("<Button-1>", lambda e, n=page_no: self._select(n))
+                        w.bind("<Double-Button-1>", lambda e, n=page_no: self._select_and_accept(n))
+                for c in range(3):
+                    self.grid.grid_columnconfigure(c, weight=1)
+        except Exception as exc:
+            messagebox.showerror("PDF Preview Error", f"Could not create PDF slide previews:\n{exc}", parent=self)
+
+    def _select(self, page_no):
+        self.selected = page_no
+        img = next((im for n, im in self.images if n == page_no), None)
+        if img is not None:
+            preview = img.copy()
+            preview.thumbnail((325, 430), Image.LANCZOS)
+            self.preview_ref = ImageTk.PhotoImage(preview)
+            self.preview.configure(image=self.preview_ref, text="")
+        self.info.set(f"Selected PDF slide: {page_no}\nThis exact slide will replace the selected page.")
+
+    def _select_and_accept(self, page_no):
+        self._select(page_no)
+        self.on_ok()
+
+    def on_ok(self):
+        if self.selected is None:
+            messagebox.showinfo("Select Slide", "Please select the exact PDF slide first.", parent=self)
+            return
+        img = next((im for n, im in self.images if n == self.selected), None)
+        if img is None:
+            return
+        self.result = (self.selected, img)
+        self.destroy()
+
+    def on_cancel(self):
+        self.result = None
+        self.destroy()
+
+
+class ResizeImageWindow(tk.Toplevel):
+    def __init__(self, parent, img_obj, callback=None, title="Resize Image", bulk_option=False, enable_reupload=False):
+        super().__init__(parent)
+        self.title(title)
+        self.resizable(False, False)
+        self.callback = callback
+        self.bulk_option = bulk_option
+        self.parent = parent
+        self.enable_reupload = enable_reupload
+
+        self.orig_img = img_obj.copy()
+        self.img_width, self.img_height = self.orig_img.size
+        self.resized_img = self.orig_img.copy()
+
+        self.configure(bg="#22222A")
+        self.geometry("760x620")
+
+        self.canvas = tk.Canvas(self, width=640, height=380, bg="#efeef5", highlightthickness=0)
+        self.canvas.pack(padx=20, pady=10)
+
+        self.photo_img = ImageTk.PhotoImage(self.resized_img)
+        self.img_id = self.canvas.create_image(320, 190, image=self.photo_img)
+        self.canvas.image = self.photo_img
+
+        sliders = tk.Frame(self, bg="#22222A")
+        sliders.pack(fill="x", pady=(0, 6))
+
+        max_w = max(self.img_width * 3, 100)
+        max_h = max(self.img_height * 3, 100)
+
+        self.w_scale = tk.Scale(sliders, from_=50, to=max_w, orient="horizontal", label="Width px", bg="#22222A", fg="white", highlightthickness=0, length=250)
+        self.w_scale.set(self.img_width)
+        self.w_scale.pack(side="left", padx=10)
+
+        self.h_scale = tk.Scale(sliders, from_=50, to=max_h, orient="horizontal", label="Height px", bg="#22222A", fg="white", highlightthickness=0, length=250)
+        self.h_scale.set(self.img_height)
+        self.h_scale.pack(side="left", padx=10)
+
+        fit_frame = tk.Frame(self, bg="#22222A")
+        fit_frame.pack(pady=(0, 8))
+
+        tk.Label(fit_frame, text="Quick Resize", bg="#22222A", fg="white").pack(side="left", padx=5)
+        tk.Button(fit_frame, text="Fit A4 Width", bg="#148B90", fg="white", command=self.fit_a4_width).pack(side="left", padx=5)
+        tk.Button(fit_frame, text="Fit A4 Height", bg="#148B90", fg="white", command=self.fit_a4_height).pack(side="left", padx=5)
+
+        btn_frame = tk.Frame(self, bg="#22222A")
+        btn_frame.pack(pady=10)
+
+        tk.Button(btn_frame, text="Save", command=self.save_and_close, bg="#2573eb", fg="white", width=10).pack(side="left", padx=10)
+        tk.Button(btn_frame, text="Cancel", command=self.destroy, bg="#ef4455", fg="white", width=10).pack(side="left", padx=10)
+
+        if self.enable_reupload:
+            tk.Button(btn_frame, text="Reupload page", command=self.reupload_page, bg="#f97316", fg="white", width=14).pack(side="left", padx=10)
+
+        self.w_scale.bind("<ButtonRelease-1>", self.resize_image)
+        self.h_scale.bind("<ButtonRelease-1>", self.resize_image)
+
+    def fit_a4_width(self):
+        target_w = 800
+        ratio = target_w / self.img_width
+        target_h = int(self.img_height * ratio)
+        self.w_scale.set(target_w)
+        self.h_scale.set(max(50, target_h))
+        self.resize_image()
+
+    def fit_a4_height(self):
+        target_h = 700
+        ratio = target_h / self.img_height
+        target_w = int(self.img_width * ratio)
+        self.h_scale.set(target_h)
+        self.w_scale.set(max(50, target_w))
+        self.resize_image()
+
+    def resize_image(self, event=None):
+        w = self.w_scale.get()
+        h = self.h_scale.get()
+        if w > 20 and h > 20:
+            self.resized_img = self.orig_img.resize((w, h), Image.LANCZOS)
+            self.photo_img = ImageTk.PhotoImage(self.resized_img)
+            self.canvas.itemconfig(self.img_id, image=self.photo_img)
+            self.canvas.image = self.photo_img
+
+    def reupload_page(self):
+        if hasattr(self.parent, "run_reupload_flow"):
+            self.parent.run_reupload_flow()
+        else:
+            messagebox.showinfo("Info", "Reupload flow not available.")
+
+    def save_and_close(self):
+        if self.callback:
+            if self.bulk_option:
+                self.callback(self.w_scale.get(), self.h_scale.get())
+            else:
+                self.callback(self.resized_img)
+        self.destroy()
+
+
+class ImageSelectDialog(tk.Toplevel):
+    def __init__(self, parent, indices, title="Select Image", all_label=True):
+        super().__init__(parent)
+        self.title(title)
+        self.parent = parent
+        self.result = None
+        self.geometry("300x400")
+        self.configure(bg="#23242e")
+        self.resizable(True, True)
+
+        main = tk.Frame(self, bg="#23242e")
+        main.pack(fill="both", expand=True, padx=10, pady=10)
+
+        tk.Label(main, text="Select image to resize", bg="#23242e", fg="white", font=("Arial", 10, "bold")).pack(anchor="w", pady=(0, 5))
+
+        list_frame = tk.Frame(main, bg="#23242e")
+        list_frame.pack(fill="both", expand=True)
+
+        self.listbox = tk.Listbox(list_frame, selectmode="single")
+        self.listbox.pack(side="left", fill="both", expand=True)
+
+        scrollbar = tk.Scrollbar(list_frame, orient="vertical", command=self.listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.listbox.config(yscrollcommand=scrollbar.set)
+
+        for idx in indices:
+            self.listbox.insert("end", f"Image {idx + 1}")
+        if all_label:
+            self.listbox.insert("end", "All")
+
+        btn_frame = tk.Frame(main, bg="#23242e")
+        btn_frame.pack(fill="x", pady=(8, 0))
+
+        tk.Button(btn_frame, text="OK", command=self.on_ok, bg="#006bce", fg="white").pack(side="left", padx=5)
+        tk.Button(btn_frame, text="Cancel", command=self.on_cancel, bg="#c0342c", fg="white").pack(side="right", padx=5)
+
+        self.transient(parent)
+        self.grab_set()
+        self.listbox.focus_set()
+
+    def on_ok(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            return
+        self.result = self.listbox.get(sel[0])
+        self.destroy()
+
+    def on_cancel(self):
+        self.result = None
+        self.destroy()
+
+
+class DeletePagesDialog(tk.Toplevel):
+    def __init__(self, parent, page_entries, title="Delete Pages"):
+        super().__init__(parent)
+        self.title(title)
+        self.parent = parent
+        self.result_indices = []
+        self.configure(bg="#23242e")
+        self.geometry("420x520")
+        self.resizable(True, True)
+
+        main = tk.Frame(self, bg="#23242e")
+        main.pack(fill="both", expand=True, padx=10, pady=10)
+
+        tk.Label(main, text="Select pages to delete", bg="#23242e", fg="white", font=("Arial", 11, "bold")).pack(anchor="w", pady=(0, 5))
+
+        canvas = tk.Canvas(main, bg="#23242e", highlightthickness=0)
+        scroll_y = tk.Scrollbar(main, orient="vertical", command=canvas.yview)
+        canvas.pack(side="left", fill="both", expand=True)
+        scroll_y.pack(side="right", fill="y")
+        canvas.configure(yscrollcommand=scroll_y.set)
+
+        inner = tk.Frame(canvas, bg="#23242e")
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        self.vars = []
+        self.page_entries = page_entries
+        for idx, info in enumerate(self.page_entries):
+            var = tk.BooleanVar(value=False)
+            cb = tk.Checkbutton(
+                inner,
+                text=f"Image {idx + 1} - line {info['line']}",
+                variable=var,
+                bg="#23242e", fg="white",
+                selectcolor="#23242e",
+                activebackground="#23242e", activeforeground="white",
+                anchor="w", padx=4
+            )
+            cb.pack(fill="x", anchor="w")
+            self.vars.append(var)
+
+        inner.update_idletasks()
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+        btn_frame = tk.Frame(main, bg="#23242e")
+        btn_frame.pack(fill="x", pady=(8, 0))
+
+        tk.Button(btn_frame, text="Delete", command=self.on_delete, bg="#c0342c", fg="white", width=10).pack(side="left", padx=5)
+        tk.Button(btn_frame, text="Cancel", command=self.on_cancel, bg="#006bce", fg="white", width=10).pack(side="right", padx=5)
+
+        self.transient(parent)
+        self.grab_set()
+        self.focus_set()
+
+    def on_delete(self):
+        self.result_indices = [i for i, v in enumerate(self.vars) if v.get()]
+        if not self.result_indices:
+            messagebox.showinfo("Info", "Please select at least one page to delete.")
+            return
+        self.destroy()
+
+    def on_cancel(self):
+        self.result_indices = []
+        self.destroy()
+
+
+class EditableTableFrame(tk.Frame):
+    """Excel/Word-like editable table embedded inside the T&C editor.
+
+    Added table-layout controls:
+      * direct cell typing and clipboard operations
+      * Excel-style multi-cell paste
+      * horizontal/vertical scrolling for large tables
+      * real-time column resizing by dragging the right edge of a header
+      * selected-column +/- width controls
+      * per-cell Wrap Text ON/OFF
+      * row-height +/- controls
+      * reset selected column width
+    """
+    def __init__(self, parent, rows, cols, on_change=None):
+        super().__init__(parent, bg="#4b5563", bd=1, relief="solid")
+        self.rows = int(rows)
+        self.cols = int(cols)
+        self.on_change = on_change
+        self.entries = []
+        self.active_cell = (0, 0)
+        self.wrap_cells = {(r, c) for r in range(self.rows) for c in range(self.cols)}
+        self.default_col_width = 145
+        self.min_col_width = 55
+        self.max_col_width = 500
+        self.default_row_height = 34
+        self.min_row_height = 24
+        self.max_row_height = 180
+        self.col_widths = [self.default_col_width for _ in range(self.cols)]
+        self.row_heights = [self.default_row_height for _ in range(self.rows)]
+        self._resize_col = None
+        self._resize_start_x = 0
+        self._resize_start_width = 0
+        self._dragging_resize = False
+
+        # Compact table toolbar. It lives with the table, so the user can adjust
+        # the exact table without leaving the T&C editor.
+        tools = tk.Frame(self, bg="#374151", height=36)
+        tools.grid(row=0, column=0, sticky="ew")
+        tools.grid_propagate(False)
+        self.tools = tools
+
+        self.selected_var = tk.StringVar(value="Cell A1")
+        tk.Label(tools, textvariable=self.selected_var, bg="#374151", fg="white",
+                 font=("Arial", 9, "bold"), padx=7).pack(side="left")
+
+        tk.Button(tools, text="− Width", command=lambda: self.adjust_column_width(-15),
+                  bg="#4b5563", fg="white", bd=0, padx=6).pack(side="left", padx=2, pady=3)
+        tk.Button(tools, text="+ Width", command=lambda: self.adjust_column_width(15),
+                  bg="#4b5563", fg="white", bd=0, padx=6).pack(side="left", padx=2, pady=3)
+        tk.Button(tools, text="Reset Width", command=self.reset_selected_column_width,
+                  bg="#4b5563", fg="white", bd=0, padx=6).pack(side="left", padx=2, pady=3)
+        tk.Button(tools, text="Wrap Text", command=self.toggle_wrap_selected,
+                  bg="#2563eb", fg="white", bd=0, padx=7).pack(side="left", padx=3, pady=3)
+        tk.Button(tools, text="Row −", command=lambda: self.adjust_row_height(-6),
+                  bg="#4b5563", fg="white", bd=0, padx=6).pack(side="left", padx=2, pady=3)
+        tk.Button(tools, text="Row +", command=lambda: self.adjust_row_height(6),
+                  bg="#4b5563", fg="white", bd=0, padx=6).pack(side="left", padx=2, pady=3)
+        tk.Label(tools, text="Drag header border = resize column",
+                 bg="#374151", fg="#cbd5e1", font=("Arial", 8, "italic")).pack(side="right", padx=8)
+
+        # Scrollable table viewport. The horizontal scrollbar is deliberately
+        # placed at the bottom so 20+ column tables remain usable in the T&C area.
+        viewport = tk.Frame(self, bg="#d1d5db")
+        viewport.grid(row=1, column=0, sticky="nsew")
+        self.viewport = viewport
+
+        self.canvas = tk.Canvas(viewport, bg="#f8fafc", highlightthickness=0,
+                                height=min(420, max(100, self.rows * self.default_row_height + 42)))
+        self.scroll_y = tk.Scrollbar(viewport, orient="vertical", command=self.canvas.yview)
+        self.scroll_x = tk.Scrollbar(viewport, orient="horizontal", command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=self.scroll_y.set, xscrollcommand=self.scroll_x.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.scroll_y.grid(row=0, column=1, sticky="ns")
+        self.scroll_x.grid(row=1, column=0, sticky="ew")
+        viewport.grid_rowconfigure(0, weight=1)
+        viewport.grid_columnconfigure(0, weight=1)
+
+        self.inner = tk.Frame(self.canvas, bg="#d1d5db")
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>", self._update_scrollregion)
+        self.canvas.bind("<Configure>", self._canvas_configure)
+        self.canvas.bind("<MouseWheel>", self._mousewheel)
+        self.canvas.bind("<Shift-MouseWheel>", self._shift_mousewheel)
+
+        # Header row used as Excel-like column handles.
+        for c in range(self.cols):
+            header = tk.Frame(self.inner, bg="#dbeafe", bd=1, relief="solid", height=30,
+                              width=self.col_widths[c])
+            header.grid(row=0, column=c, sticky="nsew")
+            header.grid_propagate(False)
+            label = tk.Label(header, text=f"Column {c + 1}", bg="#dbeafe", fg="#111827",
+                             font=("Arial", 9, "bold"), anchor="w", padx=6)
+            label.pack(fill="both", expand=True)
+            grip = tk.Frame(header, bg="#93c5fd", width=5, cursor="sb_h_double_arrow")
+            grip.place(relx=1.0, rely=0, anchor="ne", relheight=1.0)
+            grip.bind("<ButtonPress-1>", lambda ev, cc=c: self._start_col_resize(ev, cc))
+            grip.bind("<B1-Motion>", self._drag_col_resize)
+            grip.bind("<ButtonRelease-1>", self._end_col_resize)
+            label.bind("<Double-Button-1>", lambda _ev, cc=c: self.reset_column_width(cc))
+            label.bind("<Button-1>", lambda _ev, cc=c: self._select_column(cc))
+            header.bind("<Double-Button-1>", lambda _ev, cc=c: self.reset_column_width(cc))
+
+        for c in range(self.cols):
+            self.inner.grid_columnconfigure(c, minsize=self.col_widths[c], weight=0)
+
+        for r in range(self.rows):
+            row_entries = []
+            for c in range(self.cols):
+                bg = "#eef2f7" if r == 0 else "#ffffff"
+                e = tk.Entry(
+                    self.inner, font=("Arial", 10), bg=bg, fg="#111827",
+                    insertbackground="#111827", relief="flat", bd=0,
+                    highlightthickness=1, highlightbackground="#9ca3af",
+                    highlightcolor="#2563eb", state="normal", takefocus=1
+                )
+                e.grid(row=r + 1, column=c, sticky="nsew", padx=1, pady=1)
+                e.bind("<Button-1>", lambda ev, rr=r, cc=c: self._click_cell(ev, rr, cc))
+                e.bind("<FocusIn>", lambda _ev, rr=r, cc=c: self._focus_cell(rr, cc))
+                e.bind("<KeyRelease>", self._changed)
+                e.bind("<Control-v>", lambda ev, rr=r, cc=c: self._paste_matrix(ev, rr, cc))
+                e.bind("<Control-V>", lambda ev, rr=r, cc=c: self._paste_matrix(ev, rr, cc))
+                e.bind("<Control-c>", lambda ev: self._copy_cell(ev))
+                e.bind("<Control-C>", lambda ev: self._copy_cell(ev))
+                e.bind("<Control-x>", lambda ev: self._cut_cell(ev))
+                e.bind("<Control-X>", lambda ev: self._cut_cell(ev))
+                e.bind("<Control-a>", lambda ev: self._select_all_cell(ev))
+                e.bind("<Control-A>", lambda ev: self._select_all_cell(ev))
+                e.bind("<Tab>", lambda ev, rr=r, cc=c: self._move_cell(ev, rr, cc, 0, 1))
+                e.bind("<Return>", lambda ev, rr=r, cc=c: self._move_cell(ev, rr, cc, 1, 0))
+                row_entries.append(e)
+            self.entries.append(row_entries)
+
+        for r in range(self.rows):
+            self.inner.grid_rowconfigure(r + 1, minsize=self.row_heights[r], weight=0)
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+        self.after_idle(self._update_scrollregion)
+
+    def _update_scrollregion(self, _event=None):
+        try:
+            self.inner.update_idletasks()
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _canvas_configure(self, event):
+        # Do not force the inner table to the canvas width: preserving its
+        # calculated width is what makes horizontal scrolling work.
+        self._update_scrollregion()
+
+    def _mousewheel(self, event):
+        self.canvas.yview_scroll(int(-event.delta / 120), "units")
+        return "break"
+
+    def _shift_mousewheel(self, event):
+        self.canvas.xview_scroll(int(-event.delta / 120), "units")
+        return "break"
+
+    def _column_letter(self, c):
+        value = c + 1
+        out = ""
+        while value:
+            value, rem = divmod(value - 1, 26)
+            out = chr(65 + rem) + out
+        return out
+
+    def _select_column(self, c):
+        r = self.active_cell[0]
+        self._focus_cell(r, c)
+        self.entries[r][c].focus_set()
+
+    def _start_col_resize(self, event, c):
+        self._resize_col = c
+        self._resize_start_x = event.x_root
+        self._resize_start_width = self.col_widths[c]
+        self._dragging_resize = True
+        return "break"
+
+    def _drag_col_resize(self, event):
+        if self._resize_col is None:
+            return "break"
+        delta = event.x_root - self._resize_start_x
+        self.col_widths[self._resize_col] = max(
+            self.min_col_width,
+            min(self.max_col_width, self._resize_start_width + delta)
+        )
+        self._apply_column_width(self._resize_col)
+        return "break"
+
+    def _end_col_resize(self, _event=None):
+        self._resize_col = None
+        self._dragging_resize = False
+        self._changed()
+        return "break"
+
+    def _apply_column_width(self, c):
+        width = int(self.col_widths[c])
+        self.inner.grid_columnconfigure(c, minsize=width, weight=0)
+        self._update_scrollregion()
+
+    def adjust_column_width(self, delta):
+        c = self.active_cell[1]
+        self.col_widths[c] = max(self.min_col_width,
+                                 min(self.max_col_width, self.col_widths[c] + delta))
+        self._apply_column_width(c)
+        self._changed()
+
+    def reset_column_width(self, c):
+        self.col_widths[c] = self.default_col_width
+        self._apply_column_width(c)
+        self._changed()
+
+    def reset_selected_column_width(self):
+        self.reset_column_width(self.active_cell[1])
+
+    def adjust_row_height(self, delta):
+        r = self.active_cell[0]
+        self.row_heights[r] = max(self.min_row_height,
+                                  min(self.max_row_height, self.row_heights[r] + delta))
+        self.inner.grid_rowconfigure(r + 1, minsize=self.row_heights[r], weight=0)
+        self._update_scrollregion()
+        self._changed()
+
+    def toggle_wrap_selected(self):
+        cell = tuple(self.active_cell)
+        if cell in self.wrap_cells:
+            self.wrap_cells.remove(cell)
+            state = "OFF"
+        else:
+            self.wrap_cells.add(cell)
+            state = "ON"
+        self.status_message(f"Wrap Text {state} for {self._column_letter(cell[1])}{cell[0] + 1}")
+        self._changed()
+
+    def status_message(self, msg):
+        self.selected_var.set(msg)
+        self.after(1400, self._refresh_selected_label)
+
+    def _refresh_selected_label(self):
+        r, c = self.active_cell
+        wrap = "Wrap ON" if (r, c) in self.wrap_cells else "Wrap OFF"
+        width = int(self.col_widths[c])
+        self.selected_var.set(f"Cell {self._column_letter(c)}{r + 1}  |  Column {c + 1}: {width}px  |  {wrap}")
+
+    def _click_cell(self, event, r, c):
+        entry = self.entries[r][c]
+        self.active_cell = (r, c)
+        self._refresh_selected_label()
+        try:
+            entry.focus_set()
+            index = entry.index(f"@{event.x}")
+            entry.icursor(index)
+        except Exception:
+            entry.focus_force()
+        return "break"
+
+    def _focus_cell(self, r, c):
+        self.active_cell = (r, c)
+        self._refresh_selected_label()
+
+    def _select_all_cell(self, event):
+        event.widget.selection_range(0, tk.END)
+        return "break"
+
+    def _copy_cell(self, event):
+        try:
+            event.widget.event_generate("<<Copy>>")
+        except Exception:
+            pass
+        return "break"
+
+    def _cut_cell(self, event):
+        try:
+            event.widget.event_generate("<<Cut>>")
+        except Exception:
+            pass
+        self._changed()
+        return "break"
+
+    def _move_cell(self, event, r, c, dr, dc):
+        nr, nc = r + dr, c + dc
+        if nr >= self.rows:
+            nr, nc = 0, min(c + 1, self.cols - 1)
+        elif nc >= self.cols:
+            nr, nc = r + 1, 0
+            if nr >= self.rows:
+                nr = 0
+        self.active_cell = (nr, nc)
+        self.entries[nr][nc].focus_set()
+        self.entries[nr][nc].selection_range(0, tk.END)
+        self._refresh_selected_label()
+        return "break"
+
+    def _changed(self, _event=None):
+        if callable(self.on_change):
+            self.on_change()
+
+    def _paste_matrix(self, event, start_r, start_c):
+        try:
+            value = self.clipboard_get()
+        except Exception:
+            return "break"
+        rows = value.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if rows and rows[-1] == "":
+            rows.pop()
+        matrix = [row.split("\t") for row in rows]
+        if len(matrix) == 1 and len(matrix[0]) == 1:
+            entry = self.entries[start_r][start_c]
+            try:
+                entry.delete("sel.first", "sel.last")
+            except Exception:
+                pass
+            entry.insert(tk.INSERT, matrix[0][0])
+            self._changed()
+            return "break"
+        for rr, values in enumerate(matrix):
+            tr = start_r + rr
+            if tr >= self.rows:
+                break
+            for cc, value in enumerate(values):
+                tc = start_c + cc
+                if tc >= self.cols:
+                    break
+                self.entries[tr][tc].delete(0, tk.END)
+                self.entries[tr][tc].insert(0, value)
+        self._changed()
+        return "break"
+
+    def set_data(self, data):
+        for r in range(self.rows):
+            for c in range(self.cols):
+                value = data[r][c] if r < len(data) and c < len(data[r]) else ""
+                self.entries[r][c].delete(0, tk.END)
+                self.entries[r][c].insert(0, value)
+        self._changed()
+
+    def get_data(self):
+        return [[entry.get() for entry in row] for row in self.entries]
+
+    def get_pdf_col_widths(self, available_width):
+        """Convert editor pixel widths to PDF points and fit proportionally if needed."""
+        total_px = max(1, sum(self.col_widths))
+        scale = min(1.0, float(available_width) / float(total_px))
+        return [max(24, w * 0.75 * scale) for w in self.col_widths]
+
+    def cell_wraps(self, r, c):
+        return (r, c) in self.wrap_cells
+
+
+class TableDataEditorDialog(tk.Toplevel):
+    """Popup editor for an embedded table. Supports typing, normal clipboard
+    operations and Excel-style multi-cell paste (tabs + new lines)."""
+    def __init__(self, parent, table_widget):
+        super().__init__(parent)
+        self.title("Edit Table Data")
+        self.configure(bg="#23242e")
+        self.geometry("900x600")
+        self.minsize(650, 420)
+        self.transient(parent)
+        self.grab_set()
+        self.table_widget = table_widget
+        self.result = None
+        self.rows = table_widget.rows
+        self.cols = table_widget.cols
+        self.data = table_widget.get_data()
+        self.entries = []
+        self.active_cell = [0, 0]
+
+        top = tk.Frame(self, bg="#23242e")
+        top.pack(fill="x", padx=14, pady=(12, 8))
+        tk.Label(top, text="Edit Table Data", bg="#23242e", fg="white",
+                 font=("Arial", 15, "bold")).pack(anchor="w")
+        tk.Label(top,
+                 text="Type in any cell. Ctrl+C / Ctrl+V works. Copy data from Excel and paste it into the selected cell to fill multiple cells.",
+                 bg="#23242e", fg="#cbd5e1", font=("Arial", 9), wraplength=840,
+                 justify="left").pack(anchor="w", pady=(3, 0))
+
+        outer = tk.Frame(self, bg="#9ca3af", bd=1, relief="solid")
+        outer.pack(fill="both", expand=True, padx=14, pady=5)
+        canvas = tk.Canvas(outer, bg="#f8fafc", highlightthickness=0)
+        sy = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        sx = ttk.Scrollbar(outer, orient="horizontal", command=canvas.xview)
+        grid = tk.Frame(canvas, bg="#f8fafc")
+        canvas.create_window((0, 0), window=grid, anchor="nw")
+        canvas.configure(yscrollcommand=sy.set, xscrollcommand=sx.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sy.pack(side="right", fill="y")
+        sx.pack(side="bottom", fill="x")
+
+        for c in range(self.cols):
+            tk.Label(grid, text=f"Column {c + 1}", bg="#dbeafe", fg="#111827",
+                     font=("Arial", 9, "bold"), width=16, relief="solid", bd=1,
+                     pady=5).grid(row=0, column=c, sticky="nsew")
+
+        for r in range(self.rows):
+            row = []
+            for c in range(self.cols):
+                e = tk.Entry(grid, bg="white", fg="#111827", insertbackground="#111827",
+                             font=("Arial", 10), relief="solid", bd=1, width=18)
+                value = self.data[r][c] if r < len(self.data) and c < len(self.data[r]) else ""
+                e.insert(0, value)
+                e.grid(row=r + 1, column=c, sticky="nsew", ipady=7)
+                e.bind("<FocusIn>", lambda ev, rr=r, cc=c: self._select(rr, cc))
+                e.bind("<Button-1>", lambda ev, rr=r, cc=c: self._select(rr, cc))
+                e.bind("<Control-v>", self._paste_matrix)
+                e.bind("<Control-V>", self._paste_matrix)
+                e.bind("<Tab>", lambda ev, rr=r, cc=c: self._move(rr, cc, 0, 1))
+                e.bind("<Return>", lambda ev, rr=r, cc=c: self._move(rr, cc, 1, 0))
+                row.append(e)
+            self.entries.append(row)
+
+        grid.update_idletasks()
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+        buttons = tk.Frame(self, bg="#23242e")
+        buttons.pack(fill="x", padx=14, pady=(8, 14))
+        tk.Button(buttons, text="Save Table", command=self._save, bg="#107d4e", fg="white",
+                  font=("Arial", 10, "bold"), padx=18, pady=6, bd=0).pack(side="left")
+        tk.Button(buttons, text="Cancel", command=self.destroy, bg="#c0342c", fg="white",
+                  font=("Arial", 10, "bold"), padx=18, pady=6, bd=0).pack(side="right")
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        if self.entries and self.entries[0]:
+            self.entries[0][0].focus_set()
+
+    def _select(self, r, c):
+        self.active_cell = [r, c]
+
+    def _move(self, r, c, dr, dc):
+        nr, nc = r + dr, c + dc
+        if nr >= self.rows:
+            nr, nc = 0, min(c + 1, self.cols - 1)
+        elif nc >= self.cols:
+            nr, nc = r + 1, 0
+            if nr >= self.rows:
+                nr = 0
+        self.active_cell = [nr, nc]
+        self.entries[nr][nc].focus_set()
+        return "break"
+
+    def _paste_matrix(self, event=None):
+        try:
+            value = self.clipboard_get()
+        except Exception:
+            return "break"
+        r0, c0 = self.active_cell
+        matrix = value.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if matrix and matrix[-1] == "":
+            matrix.pop()
+        for rr, line in enumerate(matrix):
+            r = r0 + rr
+            if r >= self.rows:
+                break
+            values = line.split("\t")
+            for cc, cell_value in enumerate(values):
+                c = c0 + cc
+                if c >= self.cols:
+                    break
+                e = self.entries[r][c]
+                e.delete(0, tk.END)
+                e.insert(0, cell_value)
+        return "break"
+
+    def _save(self):
+        data = [[e.get() for e in row] for row in self.entries]
+        self.table_widget.set_data(data)
+        self.result = data
+        self.destroy()
+
+
+class TableInsertDialog(tk.Toplevel):
+    """Small Word/Excel-style dialog for inserting a blank table."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Insert Table")
+        self.configure(bg="#23242e")
+        self.geometry("420x260")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        self.result = None
+
+        main = tk.Frame(self, bg="#23242e")
+        main.pack(fill="both", expand=True, padx=18, pady=16)
+
+        tk.Label(
+            main, text="Create Table", bg="#23242e", fg="white",
+            font=("Arial", 15, "bold")
+        ).pack(anchor="w", pady=(0, 4))
+        tk.Label(
+            main,
+            text="Select how many rows and columns you want in the T&C table.",
+            bg="#23242e", fg="#cbd5e1", font=("Arial", 9)
+        ).pack(anchor="w", pady=(0, 14))
+
+        grid = tk.Frame(main, bg="#23242e")
+        grid.pack(fill="x")
+
+        tk.Label(grid, text="Rows", bg="#23242e", fg="white", font=("Arial", 10, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 10), pady=6)
+        self.rows_var = tk.IntVar(value=3)
+        self.rows_spin = tk.Spinbox(grid, from_=1, to=30, textvariable=self.rows_var, width=8, font=("Arial", 11), justify="center")
+        self.rows_spin.grid(row=0, column=1, sticky="w", pady=6)
+
+        tk.Label(grid, text="Columns / Cells", bg="#23242e", fg="white", font=("Arial", 10, "bold")).grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
+        self.cols_var = tk.IntVar(value=4)
+        self.cols_spin = tk.Spinbox(grid, from_=1, to=20, textvariable=self.cols_var, width=8, font=("Arial", 11), justify="center")
+        self.cols_spin.grid(row=1, column=1, sticky="w", pady=6)
+
+        tk.Label(
+            grid, text="Example: 4 rows × 5 columns = 20 cells",
+            bg="#23242e", fg="#93c5fd", font=("Arial", 9, "italic")
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        buttons = tk.Frame(main, bg="#23242e")
+        buttons.pack(fill="x", pady=(18, 0))
+        tk.Button(
+            buttons, text="Insert Table", command=self.on_ok,
+            bg="#107d4e", fg="white", font=("Arial", 10, "bold"),
+            width=14, bd=0, padx=8, pady=5
+        ).pack(side="left")
+        tk.Button(
+            buttons, text="Cancel", command=self.on_cancel,
+            bg="#c0342c", fg="white", font=("Arial", 10, "bold"),
+            width=10, bd=0, padx=8, pady=5
+        ).pack(side="right")
+
+        self.protocol("WM_DELETE_WINDOW", self.on_cancel)
+        self.rows_spin.focus_set()
+
+    def on_ok(self):
+        try:
+            rows = int(self.rows_var.get())
+            cols = int(self.cols_var.get())
+        except Exception:
+            messagebox.showerror("Invalid Table Size", "Please enter valid numbers for rows and columns.", parent=self)
+            return
+        if not (1 <= rows <= 30 and 1 <= cols <= 20):
+            messagebox.showerror("Invalid Table Size", "Rows: 1-30 and Columns: 1-20 are allowed.", parent=self)
+            return
+        self.result = (rows, cols)
+        self.destroy()
+
+    def on_cancel(self):
+        self.result = None
+        self.destroy()
+
+
+class GEMATCGenerator(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("GEM ATC Generator")
+        self.configure(bg="#23242e")
+        self.geometry(self.center_on_screen(1420, 820))
+
+        self.status_text = tk.StringVar()
+        self.temp_dir = tempfile.mkdtemp()
+
+        self.doc_list = []
+        self.tk_images = []
+        self.tracked_images = []
+        self.pdf_images = []
+        self.docs_images = []
+        self.image_archive = []
+        # Tracks the source PDF/page behind extracted Terms & Conditions text
+        # and PDF slide images, so page removal updates both representations.
+        self.tc_source_file = None
+        self.tc_line_source = {}
+        self.pdf_slide_source = {}
+        self.tc_source_ranges = {}
+
+        self.header_img_resized = None
+        self.footer_img_resized = None
+        # Page numbers on which both header and footer are intentionally hidden.
+        self.header_footer_removed_pages = set()
+        # Table metadata is kept separately from ordinary pasted images so the
+        # final PDF can render a real ReportLab table instead of a bitmap.
+        self.table_records = {}
+
+        self.font_name = "Helvetica"
+        self.bold_font_name = "Helvetica-Bold"
+
+        self.page_margin_top = 100
+        self.page_margin_bottom = 80
+        self.line_height = 18
+        self.last_cursor_pos = "1.0"
+        # Marks the first line of text that the user wants to start on the next PDF page.
+        self.manual_page_break_tag = "manual_page_break"
+
+        self.theme_colors = [
+            "#006bce", "#c0342c", "#107d4e", "#d4790c",
+            "#7646d0", "#148B90", "#f97316", "#232335"
+        ]
+        self.current_theme_index = 0
+        self.page_break_notified = False
+        self.text_sizes = {}
+        self.preview_thread = None
+        self.export_thread = None
+
+        self.target_size_mb = tk.DoubleVar(value=10.0)
+        self.target_size_unit = tk.StringVar(value="MB")
+
+        self.fast_img_cache = {}
+
+        self.preview_pdf_path = None
+        self.preview_total_pages = 0
+        self.preview_source_map = []
+        self.preview_removed_indices = set()
+
+        # Permanent preview-page removal audit. The page numbers are the
+        # numbers entered by the user at the moment of removal.
+        self.preview_removed_pages = []
+        self.preview_removal_log = []
+
+        self.preview_cache = {}
+        self.preview_rendered_pages = set()
+        self.preview_lock = Lock()
+        self.preview_layout = []
+        self.preview_page_objects = {}
+        self.preview_target_width = 480
+        self.preview_generation_id = 0
+        self.preview_loading = False
+        self.preview_update_after = None
+
+        self._build_ui()
+        self.status_text.set("Ready")
+        self.update_clock()
+
+        if not PDF2IMAGE_AVAILABLE:
+            self.status_text.set("Preview disabled: install pdf2image for live preview.")
+
+    def _build_ui(self):
+        topbar = tk.Frame(self, bg="#23242e")
+        topbar.pack(fill="x", padx=5, pady=5)
+
+        topcanvas = tk.Canvas(topbar, bg="#23242e", height=60, highlightthickness=0)
+        hscroll = tk.Scrollbar(topbar, orient="horizontal", command=topcanvas.xview)
+        topcanvas.configure(xscrollcommand=hscroll.set)
+        topcanvas.pack(side="top", fill="x", expand=True)
+        hscroll.pack(side="bottom", fill="x")
+
+        self.top_inner = tk.Frame(topcanvas, bg="#23242e")
+        topcanvas.create_window((0, 0), window=self.top_inner, anchor="nw")
+
+        def update_top_region(event=None):
+            topcanvas.configure(scrollregion=topcanvas.bbox("all"))
+
+        self.top_inner.bind("<Configure>", update_top_region)
+
+        butprops = dict(bg="#006bce", fg="#fff", font=("Arial", 10, "bold"), padx=10, pady=4, bd=0, relief="ridge")
+
+        tk.Button(self.top_inner, text="Upload Tender PDF", command=self.extract_tc, **butprops).pack(side="left", padx=3)
+        tk.Button(self.top_inner, text="Add Header", command=lambda: self.upload_image_file("header"), **butprops).pack(side="left", padx=3)
+        tk.Button(self.top_inner, text="Edit Header", command=lambda: self.edit_image("header"), **butprops).pack(side="left", padx=3)
+        tk.Button(self.top_inner, text="Add Footer", command=lambda: self.upload_image_file("footer"), **butprops).pack(side="left", padx=3)
+        tk.Button(self.top_inner, text="Edit Footer", command=lambda: self.edit_image("footer"), **butprops).pack(side="left", padx=3)
+        tk.Button(self.top_inner, text="Add Docs", command=self.prompt_add_docs, **butprops).pack(side="left", padx=3)
+        tk.Button(self.top_inner, text="Clear All", command=self.clear_all, bg="#c0342c", fg="#fff", font=("Arial", 10, "bold"), padx=10, pady=4, bd=0, relief="ridge").pack(side="left", padx=3)
+        tk.Button(self.top_inner, text="Submit Docs", command=self.insert_docs, **butprops).pack(side="left", padx=3)
+        tk.Button(self.top_inner, text="Resize Docs", command=self.resize_doc, **butprops).pack(side="left", padx=3)
+        tk.Button(self.top_inner, text="Export to PDF", command=self.export_to_pdf, **butprops).pack(side="left", padx=3)
+        tk.Button(self.top_inner, text="Change button colors", command=self.change_all_button_colors, bg="#d946ef", fg="#fff", font=("Arial", 10, "bold"), padx=10, pady=4, bd=0, relief="ridge").pack(side="left", padx=3)
+        tk.Button(self.top_inner, text="Change Text area colors", command=self.change_text_area_colors, bg="#22c55e", fg="#fff", font=("Arial", 10, "bold"), padx=10, pady=4, bd=0, relief="ridge").pack(side="left", padx=3)
+
+        compframe = tk.Frame(self.top_inner, bg="#23242e")
+        compframe.pack(side="left", padx=10)
+
+        tk.Label(compframe, text="Target PDF Size", bg="#23242e", fg="white", font=("Arial", 9, "bold")).pack(anchor="w")
+        self.size_scale = tk.Scale(compframe, from_=0.1, to=10.0, resolution=0.1, orient="horizontal", length=180, bg="#23242e", fg="white", highlightthickness=0, variable=self.target_size_mb)
+        self.size_scale.pack(side="left", padx=(0, 4))
+
+        self.unit_combo = ttk.Combobox(compframe, width=4, values=["KB", "MB"], textvariable=self.target_size_unit, state="readonly")
+        self.unit_combo.set("MB")
+        self.unit_combo.pack(side="left")
+
+        tk.Button(compframe, text="Compress Save PDF", command=self.compress_and_save_pdf, bg="#107d4e", fg="white", font=("Arial", 9, "bold")).pack(side="left", padx=5)
+        tk.Button(self.top_inner, text="Change Theme", command=self.change_theme_color, bg="#7646d0", fg="#fff", font=("Arial", 10, "bold"), padx=10, pady=4, bd=0, relief="ridge").pack(side="left", padx=3)
+        tk.Button(self.top_inner, text="Paste Rows/Columns", command=self.insert_table, bg="#0f766e", fg="#fff", font=("Arial", 10, "bold"), padx=10, pady=4, bd=0, relief="ridge").pack(side="left", padx=3)
+        tk.Button(self.top_inner, text="Header/Footer Pages", command=self.configure_header_footer_pages, bg="#9333ea", fg="#fff", font=("Arial", 10, "bold"), padx=10, pady=4, bd=0, relief="ridge").pack(side="left", padx=3)
+
+        mid = tk.Frame(self, bg="#23242e")
+        mid.pack(fill="both", expand=True, padx=6, pady=4)
+
+        left_panel = tk.Frame(mid, bg="#23242e")
+        left_panel.pack(side="left", fill="both", expand=True)
+
+        right_panel = tk.Frame(mid, bg="#181820", bd=1, relief="sunken", width=620)
+        right_panel.pack(side="right", fill="both", expand=False, padx=4)
+        right_panel.pack_propagate(False)
+
+        toolbar = tk.Frame(left_panel, bg="#23242e")
+        toolbar.pack(fill="x", pady=4)
+
+        tk.Button(toolbar, text="B", command=lambda: self.tag_add("bold")).pack(side="left", padx=2)
+        tk.Button(toolbar, text="I", command=lambda: self.tag_add("italic")).pack(side="left", padx=2)
+        tk.Button(toolbar, text="U", command=lambda: self.tag_add("underline")).pack(side="left", padx=2)
+        tk.Button(toolbar, text="L", command=lambda: self.set_alignment("left")).pack(side="left", padx=2)
+        tk.Button(toolbar, text="C", command=lambda: self.set_alignment("center")).pack(side="left", padx=2)
+        tk.Button(toolbar, text="R", command=lambda: self.set_alignment("right")).pack(side="left", padx=2)
+        tk.Button(toolbar, text="•", command=lambda: self.tag_add("bullet")).pack(side="left", padx=2)
+        tk.Button(toolbar, text="Heading", command=self.make_heading).pack(side="left", padx=2)
+
+        tk.Label(toolbar, text="Font Size", bg="#23242e", fg="white", font=("Arial", 10)).pack(side="left", padx=4)
+        self.font_size_var = tk.IntVar(value=12)
+        sizes = list(range(8, 31))
+        size_combo = ttk.Combobox(toolbar, textvariable=self.font_size_var, values=sizes, width=3)
+        size_combo.set("12")
+        size_combo.pack(side="left", padx=2)
+        size_combo.bind("<<ComboboxSelected>>", self.change_font_size)
+
+        tk.Button(toolbar, text="docs pdf paster", command=self.start_docs_pdf_paster, bg="#f97316", fg="#fff", font=("Arial", 10, "bold")).pack(side="left", padx=5)
+        tk.Button(toolbar, text="pdf paster resize", command=self.pdf_paster_resize, bg="#107d4e", fg="#fff", font=("Arial", 10, "bold")).pack(side="left", padx=2)
+        tk.Button(toolbar, text="Paste Image", command=self.paste_image_from_clipboard, bg="#148B90", fg="#fff", font=("Arial", 10, "bold")).pack(side="left", padx=5)
+        tk.Button(toolbar, text="Preview PDF", command=self.manual_preview_click, bg="#2563eb", fg="#fff", font=("Arial", 10, "bold")).pack(side="right", padx=4)
+
+        # Dedicated second-row action area. Keeping the manual page control
+        # outside the formatting toolbar prevents it from overlapping existing
+        # buttons when the window is resized.
+        page_action_bar = tk.Frame(left_panel, bg="#23242e")
+        page_action_bar.pack(fill="x", pady=(0, 4))
+        tk.Button(
+            page_action_bar,
+            text="Shift Selected Text → Next Page",
+            command=self.shift_selected_text_to_next_page,
+            bg="#b45309", fg="#fff", font=("Arial", 10, "bold"),
+            padx=10, pady=4, bd=0, relief="ridge"
+        ).pack(side="left", padx=3)
+        tk.Label(
+            page_action_bar,
+            text="Select text first, then click this button.",
+            bg="#23242e", fg="#cbd5e1", font=("Arial", 9, "italic")
+        ).pack(side="left", padx=8)
+
+        self.text = ScrolledText(
+            left_panel, wrap=tk.WORD,
+            font=(self.font_name, 12), undo=True, autoseparators=True, maxundo=-1,
+            bg="#222234", fg="#e0e0e0", insertbackground="#66cccc", selectbackground="#003366",
+            padx=12, pady=12
+        )
+        self.text.pack(fill="both", expand=True, padx=4, pady=(2, 0))
+
+        # Bottom horizontal scrollbar for wide embedded tables. Normal T&C text
+        # keeps WORD wrapping; the individual table viewport also has its own
+        # horizontal scrollbar for 20+ column tables.
+        self.tc_horizontal_scroll = tk.Scrollbar(left_panel, orient="horizontal", command=self.text.xview)
+        self.tc_horizontal_scroll.pack(fill="x", padx=4, pady=(0, 2))
+        self.text.configure(xscrollcommand=self.tc_horizontal_scroll.set)
+
+        self.text.bind("<Button-1>", self.track_cursor)
+        self.text.bind("<KeyRelease>", self.on_editor_change)
+        self.text.bind("<Key>", self.on_key)
+        self.text.bind("<<Modified>>", self.on_editor_change)
+
+        self.text.tag_config("bold", font=(self.font_name, 12, "bold"))
+        self.text.tag_config("italic", font=(self.font_name, 12, "italic"))
+        self.text.tag_config("underline", underline=1)
+        self.text.tag_config("left", justify="left")
+        self.text.tag_config("center", justify="center")
+        self.text.tag_config("right", justify="right")
+        self.text.tag_config("bullet", lmargin1=24, spacing1=7)
+        self.text.tag_config("heading", font=(self.font_name, 17, "bold"), justify="center", spacing1=14, spacing3=12)
+
+        header_frame = tk.Frame(right_panel, bg="#181820")
+        header_frame.pack(fill="x", pady=(4, 2))
+
+        tk.Label(header_frame, text="PDF Preview", bg="#181820", fg="#e5e7eb", font=("Arial", 11, "bold")).pack(side="left", padx=6)
+
+        self.page_info_var = tk.StringVar(value="Pages: 0")
+        tk.Label(header_frame, textvariable=self.page_info_var, bg="#181820", fg="#a5b4fc", font=("Arial", 10, "bold")).pack(side="left", padx=(10, 4))
+
+        self.remove_page_entry = tk.Entry(header_frame, width=8, font=("Arial", 10))
+        self.remove_page_entry.pack(side="left", padx=4)
+
+        tk.Button(header_frame, text="Remove Pages", command=self.remove_pages_from_preview_input, bg="#dc2626", fg="white", font=("Arial", 10, "bold")).pack(side="left", padx=4)
+        tk.Button(header_frame, text="Clear Removal Log", command=self.reset_removed_pages, bg="#2563eb", fg="white", font=("Arial", 10, "bold")).pack(side="left", padx=4)
+
+        self.removed_pages_var = tk.StringVar(value="Removed pages: None")
+        tk.Label(right_panel, textvariable=self.removed_pages_var, bg="#181820", fg="#fca5a5", font=("Arial", 10, "bold")).pack(anchor="w", padx=8, pady=(0, 3))
+
+        preview_wrap = tk.Frame(right_panel, bg="#181820")
+        preview_wrap.pack(fill="both", expand=True, padx=4, pady=4)
+
+        self.preview_canvas = tk.Canvas(preview_wrap, bg="#111827", highlightthickness=0)
+        self.preview_canvas.pack(side="left", fill="both", expand=True)
+
+        self.preview_scroll = tk.Scrollbar(preview_wrap, orient="vertical", command=self._preview_scroll_command)
+        self.preview_scroll.pack(side="right", fill="y")
+        self.preview_canvas.configure(yscrollcommand=self.preview_scroll.set)
+
+        self.preview_canvas.bind("<Configure>", self._on_preview_canvas_resize)
+        self.preview_canvas.bind("<MouseWheel>", self._on_preview_mousewheel)
+        self.preview_canvas.bind("<Button-4>", self._on_preview_mousewheel_linux)
+        self.preview_canvas.bind("<Button-5>", self._on_preview_mousewheel_linux)
+
+        status_frame = tk.Frame(self, bg="#23242e")
+        status_frame.pack(side="bottom", fill="x")
+
+        self.status = tk.Label(status_frame, textvariable=self.status_text, bd=1, relief="sunken", anchor="w", bg="#384150", fg="white", font=("Arial", 10))
+        self.status.pack(side="left", fill="x", expand=True)
+
+        self.clock_label = tk.Label(status_frame, text="", bd=1, relief="sunken", anchor="e", bg="#384150", fg="#ffd166", font=("Consolas", 10, "bold"))
+        self.clock_label.pack(side="right", padx=5, pady=2)
+
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress = ttk.Progressbar(status_frame, orient="horizontal", mode="determinate", variable=self.progress_var, length=180)
+        self.progress.pack(side="right", padx=5, pady=2)
+
+        self.wait_label = tk.Label(status_frame, text="", bg="#23242e", fg="#ffd166", font=("Arial", 9, "italic"))
+        self.wait_label.pack(side="right", padx=5)
+
+    def auto_contrast_fg(self, hexcolor):
+        try:
+            hexcolor = hexcolor.lstrip("#")
+            if len(hexcolor) != 6:
+                return "#000000"
+            r = int(hexcolor[0:2], 16)
+            g = int(hexcolor[2:4], 16)
+            b = int(hexcolor[4:6], 16)
+            brightness = 0.299 * r + 0.587 * g + 0.114 * b
+            return "#000000" if brightness > 186 else "#ffffff"
+        except Exception:
+            return "#000000"
+
+    def change_all_button_colors(self):
+        bgcolor = colorchooser.askcolor(title="Choose button background color")[1]
+        if not bgcolor:
+            return
+        fgcolor = self.auto_contrast_fg(bgcolor)
+
+        def apply_on_children(parent):
+            for child in parent.winfo_children():
+                if isinstance(child, tk.Button):
+                    try:
+                        child.configure(bg=bgcolor, fg=fgcolor, activebackground=bgcolor, activeforeground=fgcolor)
+                    except Exception:
+                        pass
+                if isinstance(child, (tk.Frame, tk.Canvas, tk.Toplevel, tk.LabelFrame)):
+                    apply_on_children(child)
+
+        apply_on_children(self)
+        self.status_text.set("Buttons color changed. Text kept readable.")
+
+    def change_text_area_colors(self):
+        bgcolor = colorchooser.askcolor(title="Choose editor background color")[1]
+        if not bgcolor:
+            return
+        fgcolor = self.auto_contrast_fg(bgcolor)
+        self.text.configure(bg=bgcolor, fg=fgcolor, insertbackground=fgcolor, selectbackground="#003366")
+        self.status_text.set("Text area colors updated with readable contrast.")
+
+    def on_key(self, event):
+        if event.keysym != "BackSpace":
+            return
+        try:
+            cur_index = self.text.index("insert")
+            cur_line = int(cur_index.split('.')[0])
+            to_delete_indices = []
+            for img_name in self.text.image_names():
+                idx = self.text.index(img_name)
+                line = int(idx.split('.')[0])
+                if line == cur_line:
+                    to_delete_indices.append(idx)
+            if to_delete_indices:
+                for idx in to_delete_indices:
+                    self.text.delete(idx)
+                self.tracked_images = [r for r in self.tracked_images if r[0] != cur_line]
+                self.pdf_images = [r for r in self.pdf_images if r[2] != cur_line]
+                self.docs_images = [r for r in self.docs_images if r[2] != cur_line]
+                self.image_archive = [e for e in self.image_archive if e["line"] != cur_line]
+                self.status_text.set(f"Image/slide permanently removed from line {cur_line}.")
+                self.on_editor_change()
+                return "break"
+        except Exception:
+            pass
+
+    def update_clock(self):
+        now = datetime.now()
+        timestr = now.strftime("%a %d %b %Y %I:%M:%S %p")
+        self.clock_label.config(text=timestr)
+        self.after(1000, self.update_clock)
+
+    def center_on_screen(self, w, h):
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = int((sw - w) / 2)
+        y = int((sh - h) / 2)
+        return f"{w}x{h}+{x}+{y}"
+
+    def tag_add(self, tagname):
+        try:
+            self.text.tag_add(tagname, "sel.first", "sel.last")
+        except tk.TclError:
+            currentpos = self.text.index("insert")
+            self.text.tag_add(tagname, currentpos, f"{currentpos} lineend")
+
+    def shift_selected_text_to_next_page(self):
+        """Make the line containing the current selection start on a new PDF page."""
+        try:
+            start = self.text.index("sel.first")
+            end = self.text.index("sel.last")
+        except tk.TclError:
+            messagebox.showinfo(
+                "Select Text",
+                "Please select the text you want to move to the next page first."
+            )
+            return
+
+        start_line = int(start.split(".")[0])
+        end_line = int(end.split(".")[0])
+
+        # A single page-break marker is attached to the first selected line.
+        # The selected line(s) then flow naturally together on the next page.
+        marker_start = f"{start_line}.0"
+        marker_end = f"{start_line}.0+1c"
+        self.text.tag_add(self.manual_page_break_tag, marker_start, marker_end)
+
+        self.status_text.set(
+            f"Selected text/line {start_line}"
+            + (f"-{end_line}" if end_line != start_line else "")
+            + " will start on the next PDF page."
+        )
+        self.on_editor_change()
+
+    def _line_has_tag(self, line, tagname):
+        """Return True when any part of an editor line carries the given tag."""
+        try:
+            line_start = self.text.index(f"{line}.0")
+            line_end = self.text.index(f"{line}.0 lineend")
+            ranges = self.text.tag_ranges(tagname)
+            for n in range(0, len(ranges), 2):
+                if (self.text.compare(ranges[n], "<", line_end) and
+                        self.text.compare(ranges[n + 1], ">", line_start)):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def set_alignment(self, align):
+        try:
+            start = self.text.index("sel.first")
+            end = self.text.index("sel.last")
+            for tag in ("left", "center", "right"):
+                self.text.tag_remove(tag, start, end)
+            self.text.tag_add(align, start, end)
+        except tk.TclError:
+            currentpos = self.text.index("insert")
+            line_start = f"{currentpos} linestart"
+            line_end = f"{currentpos} lineend"
+            for tag in ("left", "center", "right"):
+                self.text.tag_remove(tag, line_start, line_end)
+            self.text.tag_add(align, line_start, line_end)
+
+    def change_font_size(self, event=None):
+        size = self.font_size_var.get()
+        try:
+            start = self.text.index("sel.first")
+            end = self.text.index("sel.last")
+            tagname = f"size{size}"
+            self.text.tag_config(tagname, font=(self.font_name, size))
+            self.text.tag_add(tagname, start, end)
+            self.text_sizes[(start, end)] = size
+            self.status_text.set(f"Font size set to {size} for selection.")
+        except tk.TclError:
+            currentpos = self.text.index("insert")
+            tagname = f"size{size}"
+            self.text.tag_config(tagname, font=(self.font_name, size))
+            self.text.tag_add(tagname, currentpos, f"{currentpos} lineend")
+            self.text_sizes[(currentpos, f"{currentpos} lineend")] = size
+            self.status_text.set(f"Font size set to {size} for current line.")
+
+    def make_heading(self):
+        try:
+            start = self.text.index("sel.first")
+            end = self.text.index("sel.last")
+        except tk.TclError:
+            cur = self.text.index("insert")
+            lineno = cur.split('.')[0]
+            line_start = f"{lineno}.0"
+            line_end = f"{lineno}.0 lineend"
+            for img_name in self.text.image_names():
+                idx = self.text.index(img_name)
+                if idx.split('.')[0] == lineno:
+                    messagebox.showinfo("Info", "Image wali line ko heading nahi bana sakte. Heading ko image ke upar ya kisi text line par rakho.")
+                    return
+            start, end = line_start, line_end
+
+        for tag in ("bold", "italic", "underline", "left", "right", "center", "bullet"):
+            self.text.tag_remove(tag, start, end)
+        self.text.tag_add("heading", start, end)
+
+    def track_cursor(self, event):
+        try:
+            self.last_cursor_pos = self.text.index(f"@{event.x},{event.y}")
+        except Exception:
+            pass
+
+    def on_editor_change(self, event=None):
+        self.check_page_break_notification()
+        try:
+            self.text.edit_modified(False)
+        except Exception:
+            pass
+
+    def check_page_break_notification(self, event=None):
+        try:
+            cursorline = int(self.text.index("insert").split('.')[0])
+            pdfcontentheight = A4[1] - self.page_margin_top - self.page_margin_bottom - 120
+            maxlinesperpage = int(pdfcontentheight / self.line_height)
+            currentpage = (cursorline - 1) // maxlinesperpage
+            pageendline = (currentpage + 1) * maxlinesperpage
+            if cursorline >= pageendline - 3 and not self.page_break_notified:
+                self.page_break_notified = True
+                messagebox.showinfo("Page Break Notice", "Page break approaching. Please type your content on the next page.")
+            elif cursorline < pageendline - 3:
+                self.page_break_notified = False
+        except Exception:
+            pass
+
+    def change_theme_color(self):
+        self.current_theme_index = (self.current_theme_index + 1) % len(self.theme_colors)
+        newcolor = self.theme_colors[self.current_theme_index]
+        self.configure(bg=newcolor)
+        self.status.configure(bg=newcolor)
+        for widget in self.winfo_children():
+            try:
+                widget.configure(bg=newcolor)
+            except Exception:
+                pass
+
+    def title_for_line(self, line):
+        for l in range(line - 1, 0, -1):
+            txt = self.text.get(f"{l}.0", f"{l}.0 lineend").strip()
+            if txt:
+                return txt
+        return ""
+
+    def add_to_archive(self, line, img):
+        entry_id = id(img)
+        title = self.title_for_line(line)
+        self.image_archive.append({
+            "id": entry_id,
+            "line": line,
+            "img": img,
+            "width": img.size[0],
+            "height": img.size[1],
+            "title": title
+        })
+
+    def _update_archive_entry(self, line, newimg):
+        for entry in self.image_archive:
+            if entry["line"] == line:
+                entry["img"] = newimg
+                entry["width"], entry["height"] = newimg.size
+                entry["title"] = self.title_for_line(line)
+                return
+        self.add_to_archive(line, newimg)
+
+    def _cache_image_once(self, pil_img):
+        key = id(pil_img)
+        if key in self.fast_img_cache:
+            return self.fast_img_cache[key]
+        path = os.path.join(self.temp_dir, f"docimgfast_{key}.png")
+        pil_img.save(path, format="PNG")
+        self.fast_img_cache[key] = (path, *pil_img.size)
+        return self.fast_img_cache[key]
+
+    def _source_file_key(self, filepath):
+        try:
+            return os.path.normcase(os.path.abspath(filepath))
+        except Exception:
+            return filepath
+
+    def _mark_tc_text_range(self, start_index, end_index, source_file, pdf_page_number):
+        # Store the source page as a real Tk text tag.  Unlike editor line
+        # numbers, tag ranges move with the actual characters when content is
+        # inserted/deleted elsewhere in the Text widget.
+        source_key = self._source_file_key(source_file)
+        safe = abs(hash((source_key, pdf_page_number, datetime.now().timestamp())))
+        tag = f"tcsource_{safe}"
+        try:
+            self.text.tag_add(tag, start_index, end_index)
+            self.tc_source_ranges[(source_key, pdf_page_number)] = tag
+            self.tc_line_source[pdf_page_number] = (source_key, tag)
+        except Exception:
+            pass
+
+    def _get_tc_source_for_line(self, line):
+        try:
+            idx = self.text.index(f"{line}.0")
+            for (source_key, page_no), tag in self.tc_source_ranges.items():
+                ranges = self.text.tag_ranges(tag)
+                for n in range(0, len(ranges), 2):
+                    if self.text.compare(idx, ">=", ranges[n]) and self.text.compare(idx, "<", ranges[n + 1]):
+                        return source_key, page_no
+        except Exception:
+            pass
+        return None
+
+    def _get_tc_sources_for_line(self, line):
+        """Return every T&C source page whose tagged text contains this line."""
+        found = []
+        try:
+            idx = self.text.index(f"{line}.0")
+            for (source_key, page_no), tag in list(self.tc_source_ranges.items()):
+                ranges = self.text.tag_ranges(tag)
+                for n in range(0, len(ranges), 2):
+                    if self.text.compare(idx, ">=", ranges[n]) and self.text.compare(idx, "<", ranges[n + 1]):
+                        item = (source_key, page_no)
+                        if item not in found:
+                            found.append(item)
+                        break
+        except Exception:
+            pass
+        return found
+
+    def _delete_tc_lines_for_source_page(self, source_file, pdf_page_number):
+        if not source_file or pdf_page_number is None:
+            return 0
+
+        source_key = self._source_file_key(source_file)
+        key = (source_key, pdf_page_number)
+        tag = self.tc_source_ranges.get(key)
+        deleted_chars = 0
+
+        # Delete by the exact tagged characters, never by editor line numbers.
+        # This remains correct after PDF pages/images/docs are inserted before
+        # or after the original Terms & Conditions text.
+        if tag:
+            try:
+                # Capture all ranges first, then delete from bottom to top.
+                # Tk text indices automatically shift, so this removes the
+                # exact characters belonging to this source page even when
+                # other text/images were inserted later.
+                ranges = list(self.text.tag_ranges(tag))
+                for n in range(len(ranges) - 2, -1, -2):
+                    start_idx = ranges[n]
+                    end_idx = ranges[n + 1]
+                    if self.text.compare(start_idx, "<", end_idx):
+                        deleted_chars += len(self.text.get(start_idx, end_idx))
+                        self.text.delete(start_idx, end_idx)
+                try:
+                    self.text.tag_delete(tag)
+                except Exception:
+                    pass
+            except Exception:
+                # Last-resort fallback: remove any current ranges one by one.
+                try:
+                    while True:
+                        ranges = list(self.text.tag_ranges(tag))
+                        if len(ranges) < 2:
+                            break
+                        start_idx, end_idx = ranges[-2], ranges[-1]
+                        if not self.text.compare(start_idx, "<", end_idx):
+                            break
+                        deleted_chars += len(self.text.get(start_idx, end_idx))
+                        self.text.delete(start_idx, end_idx)
+                    try:
+                        self.text.tag_delete(tag)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            self.tc_source_ranges.pop(key, None)
+            if self.tc_line_source.get(pdf_page_number, (None, None))[0] == source_key:
+                self.tc_line_source.pop(pdf_page_number, None)
+            return deleted_chars
+
+        # Compatibility fallback for content created before the tagged-range
+        # mapping existed.
+        lines = []
+        total_lines = int(self.text.index("end-1c").split('.')[0])
+        for line in range(1, total_lines + 1):
+            info = self._get_tc_source_for_line(line)
+            if info and self._source_file_key(info[0]) == source_key and info[1] == pdf_page_number:
+                lines.append(line)
+        if lines:
+            self._remove_lines_everywhere(lines)
+        self.tc_line_source.pop(pdf_page_number, None)
+        return len(lines)
+
+    def _make_pdf_slide_id(self, pil_img):
+        # Each extracted PDF page gets its own permanent object identity.
+        # The preview page number is resolved to this identity before removal,
+        # so editor line numbers are never used as the primary PDF-slide key.
+        return f"pdfslide-{id(pil_img)}-{datetime.now().timestamp()}-{len(self.pdf_images) + 1}"
+
+    def _find_pdf_slide_record_by_id(self, pdf_slide_id):
+        if not pdf_slide_id:
+            return None
+        for rec in self.pdf_images:
+            if len(rec) >= 7 and rec[6] == pdf_slide_id:
+                return rec
+        return None
+
+    def _delete_pdf_slide_by_id(self, pdf_slide_id):
+        # Preview page -> exact PDF slide record -> exact editor image ->
+        # exact extracted T&C source page.  The important rule is that a
+        # removed preview page must also remove its corresponding text from
+        # the editor Text widget.
+        rec = self._find_pdf_slide_record_by_id(pdf_slide_id)
+        if rec is None:
+            return False
+
+        pil_img = rec[3]
+        source_info = self.pdf_slide_source.get(pdf_slide_id)
+        text_image_name = rec[7] if len(rec) >= 8 else None
+        deleted = False
+
+        # 1) Remove the exact embedded image object from the Text widget.
+        if text_image_name:
+            try:
+                if text_image_name in self.text.image_names():
+                    self.text.delete(text_image_name)
+                    deleted = True
+            except Exception:
+                pass
+
+        # Older records may not have the stored Tk image name. Keep a safe
+        # object-identity fallback for those records only.
+        if not deleted:
+            for image_name in list(self.text.image_names()):
+                try:
+                    image_index = self.text.index(image_name)
+                    for _, tracked_img, _ in self.tracked_images:
+                        if tracked_img is pil_img:
+                            self.text.delete(image_index)
+                            deleted = True
+                            break
+                    if deleted:
+                        break
+                except Exception:
+                    pass
+
+        # 2) Remove the COMPLETE extracted T&C text belonging to this source
+        # PDF page. The tag range follows the characters even when other
+        # pages/images/docs were inserted before or after the text.
+        tc_deleted = 0
+        if source_info:
+            tc_deleted = self._delete_tc_lines_for_source_page(
+                source_info[0], source_info[1]
+            )
+        else:
+            # If an old slide record has no source-file mapping, use its page
+            # number when that page number identifies exactly one extracted
+            # T&C source. This is deliberately conservative so unrelated T&C
+            # pages are never deleted.
+            inferred_page = None
+            try:
+                parts = str(pdf_slide_id).split("-")
+                for token in reversed(parts):
+                    if token.isdigit():
+                        inferred_page = int(token)
+                        break
+            except Exception:
+                inferred_page = None
+
+            if inferred_page is not None:
+                # First prefer the currently extracted tender PDF. This
+                # handles older slide records that were created before the
+                # explicit pdf_slide_source mapping was introduced.
+                current_tc_source = getattr(self, "tc_source_file", None)
+                if current_tc_source and (current_tc_source, inferred_page) in self.tc_source_ranges:
+                    tc_deleted = self._delete_tc_lines_for_source_page(
+                        current_tc_source, inferred_page
+                    )
+                else:
+                    matches = [
+                        (key, tag) for key, tag in self.tc_source_ranges.items()
+                        if key[1] == inferred_page
+                    ]
+                    if len(matches) == 1:
+                        (src_key, page_no), _ = matches[0]
+                        tc_deleted = self._delete_tc_lines_for_source_page(
+                            src_key, page_no
+                        )
+
+        # 3) Remove every internal record for the same exact image/slide.
+        self.pdf_images = [
+            r for r in self.pdf_images
+            if not (len(r) >= 7 and r[6] == pdf_slide_id)
+        ]
+        self.pdf_slide_source.pop(pdf_slide_id, None)
+        self.docs_images = [
+            r for r in self.docs_images
+            if len(r) < 4 or r[3] is not pil_img
+        ]
+        self.tracked_images = [r for r in self.tracked_images if r[1] is not pil_img]
+        self.image_archive = [e for e in self.image_archive if e.get("img") is not pil_img]
+
+        return deleted or tc_deleted > 0
+
+    def insert_image_inline(self, pil_img, align="center", ispdf=False, isdocs=False, pdf_slide_id=None):
+        insert_index = self.text.index("insert")
+        curline = int(insert_index.split('.')[0])
+        line_text = self.text.get(f"{curline}.0", f"{curline}.0 lineend")
+
+        if line_text.strip():
+            self.text.insert(f"{curline + 1}.0", "\n\n")
+            insert_index = f"{curline + 1}.0"
+
+        self.text.insert(insert_index, "")
+        insert_index = self.text.index("insert")
+        img_tk = ImageTk.PhotoImage(pil_img)
+        self.tk_images.append(img_tk)
+        before_image_names = set(self.text.image_names())
+        self.text.image_create(insert_index, image=img_tk)
+        after_image_names = set(self.text.image_names())
+        new_image_names = list(after_image_names - before_image_names)
+        text_image_name = new_image_names[0] if new_image_names else None
+        self.text.insert(self.text.index(f"{insert_index} lineend"), "\n\n")
+        lineno = int(self.text.index(insert_index).split('.')[0])
+
+        rec = (lineno, pil_img, align)
+        self.tracked_images = [r for r in self.tracked_images if r[0] != lineno]
+        self.tracked_images.append(rec)
+        self.add_to_archive(lineno, pil_img)
+
+        if ispdf:
+            if pdf_slide_id is None:
+                pdf_slide_id = self._make_pdf_slide_id(pil_img)
+            self.pdf_images = [r for r in self.pdf_images if r[2] != lineno]
+            self.pdf_images.append(["img", None, lineno, pil_img, None, align, pdf_slide_id, text_image_name])
+            if pdf_slide_id is not None and hasattr(self, "_pending_pdf_source") and self._pending_pdf_source:
+                self.pdf_slide_source[pdf_slide_id] = self._pending_pdf_source
+
+        if isdocs:
+            self.docs_images = [r for r in self.docs_images if r[2] != lineno]
+            self.docs_images.append(["img", None, lineno, pil_img, None, align, text_image_name])
+
+        self.on_editor_change()
+        return lineno
+
+    def insert_image_on_newline(self, pil_img, align="center", aroundline=None, ispdf=False, isdocs=False, pdf_slide_id=None):
+        if aroundline is None:
+            return self.insert_image_inline(pil_img, align, ispdf=ispdf, isdocs=isdocs, pdf_slide_id=pdf_slide_id)
+
+        insertline = aroundline + 1
+        self.text.insert(f"{insertline}.0", "\n\n")
+        insertline = int(self.text.index(f"{insertline}.0").split('.')[0])
+
+        img_tk = ImageTk.PhotoImage(pil_img)
+        self.tk_images.append(img_tk)
+        before_image_names = set(self.text.image_names())
+        self.text.image_create(f"{insertline}.0", image=img_tk)
+        after_image_names = set(self.text.image_names())
+        new_image_names = list(after_image_names - before_image_names)
+        text_image_name = new_image_names[0] if new_image_names else None
+        self.text.insert(f"{insertline}.0 lineend", "\n\n")
+
+        rec = (insertline, pil_img, align)
+        self.tracked_images = [r for r in self.tracked_images if r[0] != insertline]
+        self.tracked_images.append(rec)
+        self.add_to_archive(insertline, pil_img)
+
+        if ispdf:
+            if pdf_slide_id is None:
+                pdf_slide_id = self._make_pdf_slide_id(pil_img)
+            self.pdf_images = [r for r in self.pdf_images if r[2] != insertline]
+            self.pdf_images.append(["img", None, insertline, pil_img, None, align, pdf_slide_id, text_image_name])
+            if pdf_slide_id is not None and hasattr(self, "_pending_pdf_source") and self._pending_pdf_source:
+                self.pdf_slide_source[pdf_slide_id] = self._pending_pdf_source
+
+        if isdocs:
+            self.docs_images = [r for r in self.docs_images if r[2] != insertline]
+            self.docs_images.append(["img", None, insertline, pil_img, None, align, text_image_name])
+
+        self.on_editor_change()
+        return insertline
+
+    def paste_image_from_clipboard(self):
+        try:
+            img = ImageGrab.grabclipboard()
+            if img is None:
+                messagebox.showinfo("Info", "Clipboard me koi image nahi hai.")
+                return
+            img = img.convert("RGB")
+            if img.width > 700:
+                img = img.resize((700, int(700 / img.width * img.height)), Image.LANCZOS)
+            newline = self.insert_image_inline(img, "center", isdocs=True)
+            self.status_text.set(f"Image pasted from clipboard on line {newline}.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Clipboard se image paste nahi ho paya:\n{e}")
+
+    def edit_table_data(self):
+        """Open a professional popup editor for an existing T&C table."""
+        live = [name for name in list(self.table_records) if name in self.text.window_names()]
+        if not live:
+            messagebox.showinfo("Table Editor", "Pehle Terms & Conditions mein table insert karein.")
+            return
+        if len(live) == 1:
+            self._open_table_data_editor(live[0])
+            return
+        chooser = tk.Toplevel(self)
+        chooser.title("Select Table")
+        chooser.configure(bg="#23242e")
+        chooser.geometry("440x320")
+        chooser.transient(self); chooser.grab_set()
+        tk.Label(chooser, text="Select table to edit", bg="#23242e", fg="white", font=("Arial", 13, "bold")).pack(anchor="w", padx=16, pady=(14,8))
+        lb = tk.Listbox(chooser, bg="white", fg="#111827", font=("Arial", 10), height=9)
+        lb.pack(fill="both", expand=True, padx=16, pady=5)
+        for idx, name in enumerate(live, 1):
+            rec = self.table_records[name]
+            line = self.text.index(name).split(".")[0]
+            lb.insert(tk.END, f"Table {idx}  |  {rec.get('rows',1)} x {rec.get('cols',1)}  |  line {line}")
+        def choose():
+            sel = lb.curselection()
+            if not sel:
+                messagebox.showinfo("Select Table", "Please select a table first.", parent=chooser); return
+            name = live[sel[0]]
+            chooser.destroy()
+            self._open_table_data_editor(name)
+        bf=tk.Frame(chooser,bg="#23242e"); bf.pack(fill="x",padx=16,pady=12)
+        tk.Button(bf,text="Edit Selected Table",command=choose,bg="#107d4e",fg="white",font=("Arial",10,"bold"),padx=12,pady=5).pack(side="left")
+        tk.Button(bf,text="Cancel",command=chooser.destroy,bg="#c0342c",fg="white",font=("Arial",10,"bold"),padx=12,pady=5).pack(side="right")
+
+    def _open_table_data_editor(self, window_name):
+        rec = self.table_records.get(window_name)
+        if not rec or rec.get("widget") is None:
+            messagebox.showerror("Table Error", "Table editor record not found.")
+            return
+        dlg = TableDataEditorDialog(self, rec["widget"])
+        self.wait_window(dlg)
+        if dlg.result is not None:
+            self.status_text.set(f"Table data updated: {rec.get('rows',1)} rows x {rec.get('cols',1)} columns.")
+            self.on_editor_change()
+
+    def insert_table(self):
+        """Insert a directly editable Excel/Word-style table at the cursor."""
+        dlg = TableInsertDialog(self)
+        self.wait_window(dlg)
+        if not dlg.result:
+            return
+        rows, cols = dlg.result
+        try:
+            table_frame = EditableTableFrame(
+                self.text, rows, cols,
+                on_change=lambda: self.status_text.set(
+                    f"Editing table: {rows} rows x {cols} columns"
+                )
+            )
+
+            before = set(self.text.window_names())
+            insert_at = self.text.index(tk.INSERT)
+            self.text.window_create(insert_at, window=table_frame, align="center", padx=2, pady=4)
+            # Put the insertion cursor on the next editor line so normal T&C
+            # typing can continue below the table.
+            self.text.insert(tk.INSERT, "\n")
+            self.text.update_idletasks()
+            after = set(self.text.window_names())
+            new_names = list(after - before)
+            if not new_names:
+                table_frame.destroy()
+                messagebox.showerror("Table Error", "Editable table could not be inserted into Terms & Conditions.")
+                return
+
+            window_name = new_names[0]
+            self.table_records[window_name] = {
+                "rows": rows,
+                "cols": cols,
+                "line": int(self.text.index(window_name).split('.')[0]),
+                "widget": table_frame,
+                "window_name": window_name,
+                "col_widths": list(getattr(table_frame, "col_widths", [])),
+                "row_heights": list(getattr(table_frame, "row_heights", [])),
+            }
+            self.status_text.set(
+                f"Editable table inserted: {rows} rows x {cols} columns. Click any cell and type or paste data."
+            )
+            self.on_editor_change()
+            # Give the first cell real keyboard focus immediately. The user can
+            # now type directly into the inserted table without needing another
+            # dialog. The Edit Table Data popup remains available for bulk paste.
+            self.text.update_idletasks()
+            try:
+                table_frame.entries[0][0].focus_force()
+                table_frame.entries[0][0].selection_range(0, tk.END)
+            except Exception:
+                pass
+        except Exception as e:
+            messagebox.showerror("Table Error", f"Could not insert editable table:\n{e}")
+
+
+    def _table_records_by_line(self):
+        """Resolve editable table windows to their current Text line numbers."""
+        result = {}
+        live_names = set(self.text.window_names())
+        stale = []
+        for window_name, rec in list(self.table_records.items()):
+            if window_name not in live_names:
+                stale.append(window_name)
+                continue
+            try:
+                line = int(self.text.index(window_name).split('.')[0])
+                rec["line"] = line
+                result[line] = rec
+            except Exception:
+                stale.append(window_name)
+        for name in stale:
+            self.table_records.pop(name, None)
+        return result
+
+
+    def configure_header_footer_pages(self):
+        """Choose final PDF page numbers where BOTH header and footer are hidden."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Remove Header & Footer From Pages")
+        dlg.configure(bg="#23242e")
+        dlg.geometry("500x290")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        main = tk.Frame(dlg, bg="#23242e")
+        main.pack(fill="both", expand=True, padx=18, pady=16)
+        tk.Label(main, text="Header / Footer Page Control", bg="#23242e", fg="white", font=("Arial", 14, "bold")).pack(anchor="w")
+        tk.Label(
+            main,
+            text="Enter final PDF page numbers where BOTH header and footer should be removed.\nExamples: 6,7  or  6-8  or  2,5-7",
+            bg="#23242e", fg="#cbd5e1", justify="left", font=("Arial", 9)
+        ).pack(anchor="w", pady=(8, 12))
+
+        current = ",".join(str(x) for x in sorted(self.header_footer_removed_pages))
+        entry = tk.Entry(main, font=("Arial", 12), bg="white", fg="black")
+        entry.pack(fill="x", pady=5)
+        entry.insert(0, current)
+        entry.focus_set()
+
+        info = tk.StringVar(value=f"Currently hidden on: {current or 'None'}")
+        tk.Label(main, textvariable=info, bg="#23242e", fg="#93c5fd", font=("Arial", 9, "italic")).pack(anchor="w", pady=6)
+
+        buttons = tk.Frame(main, bg="#23242e")
+        buttons.pack(fill="x", pady=(10, 0))
+
+        def parse_pages(value):
+            pages = set()
+            for chunk in value.split(","):
+                chunk = chunk.strip()
+                if not chunk:
+                    continue
+                if "-" in chunk:
+                    a, b = chunk.split("-", 1)
+                    a, b = int(a.strip()), int(b.strip())
+                    if a <= 0 or b <= 0:
+                        raise ValueError
+                    lo, hi = sorted((a, b))
+                    pages.update(range(lo, hi + 1))
+                else:
+                    n = int(chunk)
+                    if n <= 0:
+                        raise ValueError
+                    pages.add(n)
+            return pages
+
+        def apply():
+            value = entry.get().strip()
+            if not value:
+                self.header_footer_removed_pages = set()
+                self.status_text.set("Header and footer restored on all pages.")
+                dlg.destroy()
+                return
+            try:
+                pages = parse_pages(value)
+            except Exception:
+                messagebox.showerror("Invalid Page Numbers", "Use examples like 6,7 or 6-8 or 2,5-7.", parent=dlg)
+                return
+            self.header_footer_removed_pages = pages
+            self.status_text.set(
+                "Header/footer removed from page(s): " + ", ".join(str(x) for x in sorted(pages))
+            )
+            dlg.destroy()
+
+        tk.Button(buttons, text="Apply", command=apply, bg="#107d4e", fg="white", font=("Arial", 10, "bold"), width=12).pack(side="left")
+        tk.Button(buttons, text="Clear All", command=lambda: (entry.delete(0, tk.END), info.set("Currently hidden on: None")), bg="#2563eb", fg="white", font=("Arial", 10, "bold"), width=12).pack(side="left", padx=8)
+        tk.Button(buttons, text="Cancel", command=dlg.destroy, bg="#c0342c", fg="white", font=("Arial", 10, "bold"), width=12).pack(side="right")
+
+    def _should_hide_header_footer(self, page_number):
+        return int(page_number) in getattr(self, "header_footer_removed_pages", set())
+
+    def upload_image_file(self, place):
+        filepath = filedialog.askopenfilename(
+            title=f"Select {place} JPG/PNG",
+            filetypes=[("Image Files", "*.jpg *.jpeg *.png")]
+        )
+        if not filepath:
+            return
+        try:
+            img = Image.open(filepath).convert("RGB")
+            if place == "header":
+                self.header_img_resized = img
+            else:
+                self.footer_img_resized = img
+            msg = f"{place.capitalize()} added successfully."
+            self.status_text.set(msg)
+            messagebox.showinfo("Success", msg)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load image:\n{e}")
+
+    def edit_image(self, imgtype):
+        imgobj = getattr(self, f"{imgtype}_img_resized", None)
+        if imgobj is None:
+            messagebox.showinfo("Info", f"No {imgtype} to edit. Please upload first.")
+            return
+
+        def callback(resized_img):
+            setattr(self, f"{imgtype}_img_resized", resized_img)
+            self.status_text.set(f"{imgtype.capitalize()} resized.")
+
+        ResizeImageWindow(self, imgobj, callback, title=f"Resize {imgtype}").focus()
+
+    def _reupload_source_info(self, entry):
+        """Return human-readable source information without changing stored records."""
+        line = entry.get("line")
+        for rec in self.docs_images:
+            if len(rec) >= 4 and rec[0] == "img" and rec[2] == line:
+                return {"label": "Add Docs / Submit Docs", "detail": "Inserted document/image page"}
+        for rec in self.pdf_images:
+            if len(rec) >= 7 and rec[0] == "img" and rec[2] == line:
+                slide_id = rec[6]
+                source = self.pdf_slide_source.get(slide_id)
+                if source:
+                    path, page_no = source
+                    return {
+                        "label": "PDF Paster",
+                        "detail": f"PDF: {os.path.basename(path)}  |  Slide: {page_no}"
+                    }
+                return {"label": "PDF Paster", "detail": "Pasted PDF/JPG page"}
+        return {"label": "Pasted Image", "detail": "Image inserted in Terms & Conditions"}
+
+    def _remove_reupload_target_records(self, entry):
+        """Remove only the selected image's bookkeeping; text content stays intact."""
+        oldline = entry["line"]
+        oldimg = entry.get("img")
+        old_slide_ids = []
+        for rec in self.pdf_images:
+            if len(rec) >= 7 and rec[0] == "img" and rec[2] == oldline:
+                old_slide_ids.append(rec[6])
+        self._delete_editor_line_image_only(oldline)
+        self.tracked_images = [r for r in self.tracked_images if r[0] != oldline]
+        self.pdf_images = [r for r in self.pdf_images if r[2] != oldline]
+        self.docs_images = [r for r in self.docs_images if r[2] != oldline]
+        self.image_archive = [e for e in self.image_archive if e is not entry and e.get("line") != oldline]
+        for sid in old_slide_ids:
+            self.pdf_slide_source.pop(sid, None)
+        return oldline, oldimg
+
+    def run_reupload_flow(self):
+        """Visual, safe re-upload flow. Existing replacement backend behavior is preserved."""
+        if not self.image_archive:
+            messagebox.showinfo("Archive", "No pages/images saved in archive.")
+            return
+
+        # Snapshot the archive so selecting/searching in the dialog never mutates it.
+        entries = [dict(e) for e in self.image_archive if e.get("img") is not None]
+        dlg = ReuploadPageSelector(self, entries, self._reupload_source_info)
+        self.wait_window(dlg)
+        entry = dlg.result
+        if not entry:
+            return
+
+        oldline = entry["line"]
+        oldw, oldh = entry.get("width", entry["img"].size[0]), entry.get("height", entry["img"].size[1])
+        old_pdf = any(r[0] == "img" and r[2] == oldline for r in self.pdf_images)
+        old_docs = any(r[0] == "img" and r[2] == oldline for r in self.docs_images)
+
+        path = filedialog.askopenfilename(
+            title=f"Select replacement for selected page (line {oldline})",
+            filetypes=[
+                ("Images or PDF", "*.jpg *.jpeg *.png *.pdf"),
+                ("Image Files", "*.jpg *.jpeg *.png"),
+                ("PDF Files", "*.pdf"),
+                ("All Files", "*.*"),
+            ]
+        )
+        # IMPORTANT: do not remove the old page until the replacement has been
+        # successfully selected and prepared.
+        if not path:
+            self.status_text.set("Reupload cancelled. Original page is unchanged.")
+            return
+
+        ext = os.path.splitext(path)[1].lower()
+        replacement_img = None
+        replacement_pdf_page = None
+
+        try:
+            if ext == ".pdf":
+                pdfdlg = ReuploadPDFPageSelector(self, path)
+                self.wait_window(pdfdlg)
+                if not pdfdlg.result:
+                    self.status_text.set("PDF slide selection cancelled. Original page is unchanged.")
+                    return
+                replacement_pdf_page, replacement_img = pdfdlg.result
+            else:
+                replacement_img = Image.open(path).convert("RGB")
+
+            if replacement_img is None:
+                raise ValueError("Replacement image could not be loaded.")
+
+            replacement_img = replacement_img.resize((oldw, oldh), Image.LANCZOS)
+
+            # Confirmation is shown after the exact new image/slide is known.
+            confirm = messagebox.askyesno(
+                "Confirm Page Replacement",
+                f"Replace editor line {oldline}?\n\n"
+                f"Old page: selected visual page\n"
+                f"New file: {os.path.basename(path)}"
+                + (f"\nNew PDF slide: {replacement_pdf_page}" if replacement_pdf_page else "")
+                + "\n\nThe old page will be replaced at the same location.",
+                parent=self
+            )
+            if not confirm:
+                self.status_text.set("Replacement cancelled. Original page is unchanged.")
+                return
+
+            # Only now remove the old visual page and insert the replacement.
+            self._remove_reupload_target_records(entry)
+            self._pending_pdf_source = None
+
+            if replacement_pdf_page is not None:
+                pdf_slide_id = f"pdfslide-reupload-{replacement_pdf_page}-{id(replacement_img)}"
+                self._pending_pdf_source = (self._source_file_key(path), replacement_pdf_page)
+                newline = self.insert_image_on_newline(
+                    replacement_img, "center", aroundline=oldline,
+                    ispdf=True, isdocs=old_docs, pdf_slide_id=pdf_slide_id
+                )
+                self._pending_pdf_source = None
+                self.status_text.set(
+                    f"Page reuploaded successfully: PDF slide {replacement_pdf_page} -> editor line {newline}."
+                )
+            else:
+                newline = self.insert_image_on_newline(
+                    replacement_img, "center", aroundline=oldline,
+                    ispdf=old_pdf, isdocs=old_docs
+                )
+                self.status_text.set(
+                    f"Image reuploaded successfully -> editor line {newline}."
+                )
+
+            self.on_editor_change()
+
+        except Exception as exc:
+            self._pending_pdf_source = None
+            messagebox.showerror(
+                "Reupload Error",
+                f"Replacement could not be completed.\n\n{exc}\n\n"
+                "The original page was kept if replacement had not started.",
+                parent=self
+            )
+
+    def prompt_add_docs(self):
+        self.doc_list = filedialog.askopenfilenames(
+            title="Select Additional Documents / Images / Word / PDF",
+            filetypes=[
+                ("Supported Files", "*.jpg *.jpeg *.png *.doc *.docx *.pdf"),
+                ("Image Files", "*.jpg *.jpeg *.png"),
+                ("Word Files", "*.doc *.docx"),
+                ("PDF Files", "*.pdf"),
+                ("All Files", "*.*"),
+            ]
+        )
+        if self.doc_list:
+            msg = f"{len(self.doc_list)} documents selected."
+            self.status_text.set(msg)
+            messagebox.showinfo("Documents", msg)
+
+    def insert_single_image_doc(self, img):
+        self.insert_image_inline(img, "center", isdocs=True)
+
+    def insert_pdf_file_as_images_at_cursor(self, pdfpath):
+        try:
+            with pdfplumber.open(pdfpath) as pdf:
+                insert_after = None
+                for pdf_page_number, page in enumerate(pdf.pages, start=1):
+                    imgpage = page.to_image(resolution=400).original.convert("RGB")
+                    if imgpage.width > 1000:
+                        imgpage = imgpage.resize((1000, int(imgpage.height * 1000 / imgpage.width)), Image.LANCZOS)
+                    pdf_slide_id = f"pdfslide-doc-{pdf_page_number}-{id(imgpage)}"
+                    self._pending_pdf_source = (self._source_file_key(pdfpath), pdf_page_number)
+                    if insert_after is None:
+                        insert_after = self.insert_image_inline(
+                            imgpage, "center", isdocs=True, ispdf=True, pdf_slide_id=pdf_slide_id
+                        )
+                    else:
+                        insert_after = self.insert_image_on_newline(
+                            imgpage, "center", aroundline=insert_after, isdocs=True, ispdf=True,
+                            pdf_slide_id=pdf_slide_id
+                        )
+                    self._pending_pdf_source = None
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to convert Doc PDF pages to images:\n{e}")
+
+    def insert_docs(self):
+        if not self.doc_list:
+            messagebox.showinfo("Info", "No documents selected.")
+            return
+
+        if not DOCX2PDF_AVAILABLE:
+            for p in self.doc_list:
+                if os.path.splitext(p)[1].lower() in (".doc", ".docx"):
+                    messagebox.showwarning("docx2pdf missing", "Word files ko image ke roop me add karne ke liye pip install docx2pdf install karna zaruri hai.")
+                    break
+
+        self.progress_var.set(0)
+        self.progress.config(mode="determinate")
+        self.wait_label.config(text="Please wait, inserting Add Docs...")
+        self.status_text.set("Inserting Add Docs as images...")
+        Thread(target=self._insert_docs_thread, daemon=True).start()
+
+    def _insert_docs_thread(self):
+        total = len(self.doc_list)
+        num_images_inserted = 0
+        for idx, doc in enumerate(self.doc_list, start=1):
+            ext = os.path.splitext(doc)[1].lower()
+            try:
+                if ext in (".jpg", ".jpeg", ".png"):
+                    img = Image.open(doc).convert("RGB")
+                    if img.width > 700:
+                        img = img.resize((700, int(700 * img.height / img.width)), Image.LANCZOS)
+                    self.after(0, self.insert_single_image_doc, img)
+                    num_images_inserted += 1
+                elif ext in (".doc", ".docx"):
+                    if DOCX2PDF_AVAILABLE:
+                        temp_pdf = os.path.join(self.temp_dir, f"wordconv_{os.path.basename(doc)}.pdf")
+                        docx2pdf_convert(doc, temp_pdf)
+                        self.after(0, self.insert_pdf_file_as_images_at_cursor, temp_pdf)
+                        num_images_inserted += 1
+                elif ext == ".pdf":
+                    self.after(0, self.insert_pdf_file_as_images_at_cursor, doc)
+                    num_images_inserted += 1
+            except Exception as e:
+                self.after(0, lambda msg=str(e): messagebox.showerror("Error", f"Failed to insert document:\n{msg}"))
+
+            progress_val = idx / total * 100.0
+            self.after(0, self.progress_var.set, progress_val)
+
+        def finish():
+            msg = f"{num_images_inserted} documents added as images."
+            self.doc_list = []
+            self.status_text.set(msg)
+            self.wait_label.config(text="")
+            self.progress_var.set(0)
+            messagebox.showinfo("Success", msg)
+
+        self.after(0, finish)
+
+    def start_docs_pdf_paster(self):
+        filetypes = [("PDF or Image", "*.pdf *.jpg *.jpeg *.png"), ("All Files", "*.*")]
+        path = filedialog.askopenfilename(title="Select PDF/JPG for Paste", filetypes=filetypes)
+        if not path:
+            return
+        ext = os.path.splitext(path)[1].lower()
+        self.progress_var.set(0)
+        self.progress.config(mode="determinate")
+        self.wait_label.config(text="Please Wait Fetching Data...")
+        self.status_text.set("Loading document pages as images...")
+        if ext == ".pdf":
+            Thread(target=self._docs_pdf_paster_thread, args=(path,), daemon=True).start()
+        else:
+            Thread(target=self._single_image_paster_thread, args=(path,), daemon=True).start()
+
+    def _docs_pdf_paster_thread(self, pdfpath):
+        try:
+            with pdfplumber.open(pdfpath) as pdf:
+                totalpages = len(pdf.pages) or 1
+                for idx, page in enumerate(pdf.pages, start=1):
+                    imgpage = page.to_image(resolution=400).original.convert("RGB")
+                    if imgpage.width > 1000:
+                        imgpage = imgpage.resize((1000, int(imgpage.height * 1000 / imgpage.width)), Image.LANCZOS)
+                    self.after(0, self.insert_pdf_page_image, imgpage, idx, pdfpath)
+                    progressval = idx / totalpages * 100.0
+                    self.after(0, self.progress_var.set, progressval)
+                self.after(0, self.pdf_paste_done)
+        except Exception as e:
+            def showerr():
+                messagebox.showerror("Error", f"Failed to paste PDF as images:\n{e}")
+                self.status_text.set("Error processing PDF.")
+                self.wait_label.config(text="")
+                self.progress_var.set(0)
+            self.after(0, showerr)
+
+    def _single_image_paster_thread(self, imgpath):
+        try:
+            imgpage = Image.open(imgpath).convert("RGB")
+            if imgpage.width > 1000:
+                imgpage = imgpage.resize((1000, int(imgpage.height * 1000 / imgpage.width)), Image.LANCZOS)
+            self.after(0, self.insert_pdf_page_image, imgpage)
+            self.after(0, self.progress_var.set, 100.0)
+            self.after(0, self.pdf_paste_done)
+        except Exception as e:
+            def showerr():
+                messagebox.showerror("Error", f"Failed to paste image as page:\n{e}")
+                self.status_text.set("Error processing image.")
+                self.wait_label.config(text="")
+                self.progress_var.set(0)
+            self.after(0, showerr)
+
+    def insert_pdf_page_image(self, imgpage, pdf_page_number=None, source_pdf_path=None):
+        endline = int(self.text.index("end-1c").split('.')[0])
+        pdf_slide_id = None
+        if pdf_page_number is not None:
+            pdf_slide_id = f"pdfslide-paster-{pdf_page_number}-{id(imgpage)}"
+            if source_pdf_path:
+                self._pending_pdf_source = (self._source_file_key(source_pdf_path), pdf_page_number)
+        newline = self.insert_image_on_newline(
+            imgpage,
+            "center",
+            aroundline=endline,
+            ispdf=True,
+            pdf_slide_id=pdf_slide_id
+        )
+        self.text.mark_set(tk.INSERT, f"{newline + 1}.0")
+        self._pending_pdf_source = None
+        self.on_editor_change()
+
+    def pdf_paste_done(self):
+        self.status_text.set("Document pages pasted as images.")
+        self.wait_label.config(text="")
+        self.progress_var.set(0)
+        self.on_editor_change()
+
+    def _delete_editor_line_image_only(self, line):
+        to_delete = []
+        for img_name in self.text.image_names():
+            idx = self.text.index(img_name)
+            if int(idx.split('.')[0]) == line:
+                to_delete.append(idx)
+        for idx in to_delete:
+            self.text.delete(idx)
+
+    def pdf_paster_resize(self):
+        imgs = [i for i, item in enumerate(self.pdf_images) if item[0] == "img"]
+        if not imgs:
+            messagebox.showinfo("Info", "No pasted document PDF/JPG images to resize or delete.")
+            return
+
+        choicewin = tk.Toplevel(self)
+        choicewin.title("PDF Paster Actions")
+        choicewin.configure(bg="#23242e")
+        tk.Label(choicewin, text="Choose action for PDF/JPG pages", bg="#23242e", fg="white", font=("Arial", 10, "bold")).pack(padx=10, pady=(10, 5))
+        choicevar = tk.StringVar(value="resize")
+        tk.Radiobutton(choicewin, text="Resize pages", value="resize", variable=choicevar, bg="#23242e", fg="white", selectcolor="#23242e").pack(anchor="w", padx=15, pady=2)
+        tk.Radiobutton(choicewin, text="Delete pages", value="delete", variable=choicevar, bg="#23242e", fg="white", selectcolor="#23242e").pack(anchor="w", padx=15, pady=2)
+
+        def onokchoice():
+            choicewin.destroy()
+
+        tk.Button(choicewin, text="OK", command=onokchoice, bg="#006bce", fg="white").pack(pady=8)
+        choicewin.transient(self)
+        choicewin.grab_set()
+        self.wait_window(choicewin)
+
+        if choicevar.get() == "resize":
+            dialog = ImageSelectDialog(self, imgs, title="Resize PDF/JPG Images")
+            self.wait_window(dialog)
+            choice = dialog.result
+            if not choice:
+                return
+            choice = choice.strip().lower()
+            if choice == "all":
+                firstimg = self.pdf_images[imgs[0]][3]
+                ResizeImageWindow(self, firstimg, lambda w, h: self.resize_all_pdf_images_keep_only_resized(w, h), title="Resize All PDF/JPG Images", bulk_option=True, enable_reupload=True).focus()
+            else:
+                try:
+                    selectedidx = int(choice.split()[-1]) - 1
+                    if selectedidx in imgs:
+                        self.launch_pdf_resize(selectedidx)
+                    else:
+                        messagebox.showerror("Error", f"Image {selectedidx + 1} not found.")
+                except Exception:
+                    messagebox.showerror("Error", "Invalid selection!")
+        elif choicevar.get() == "delete":
+            pageinfos = []
+            for rec in self.pdf_images:
+                if rec[0] == "img" and rec[3] is not None:
+                    pageinfos.append({"rec": rec, "line": rec[2]})
+            if not pageinfos:
+                messagebox.showinfo("Info", "No PDF/JPG pages available to delete.")
+                return
+            dlg = DeletePagesDialog(self, pageinfos, title="Delete Pages")
+            self.wait_window(dlg)
+            idxs = dlg.result_indices
+            if not idxs:
+                return
+            lines_to_remove = set()
+            new_pdf_images = []
+            for i, info in enumerate(pageinfos):
+                if i in idxs:
+                    lines_to_remove.add(info["line"])
+                else:
+                    new_pdf_images.append(info["rec"])
+            self.docs_images = [r for r in self.docs_images if r[2] not in lines_to_remove]
+            self.pdf_images = new_pdf_images
+            self._remove_lines_everywhere(lines_to_remove)
+            self.status_text.set(f"Deleted {len(lines_to_remove)} PDF/JPG pages.")
+            self.on_editor_change()
+
+    def resize_all_pdf_images_keep_only_resized(self, width, height):
+        line_to_rec = {}
+        for reclist in self.pdf_images:
+            if reclist[0] == "img" and reclist[3] is not None:
+                line_to_rec[reclist[2]] = reclist
+        new_pdf_images = []
+        new_tracked = []
+        for line, reclist in sorted(line_to_rec.items()):
+            self._delete_editor_line_image_only(line)
+            resizedimg = reclist[3].resize((width, height), Image.LANCZOS)
+            imgtk = ImageTk.PhotoImage(resizedimg)
+            self.tk_images.append(imgtk)
+            indexstr = f"{line}.0"
+            self.text.image_create(indexstr, image=imgtk)
+            reclist[3] = resizedimg
+            new_pdf_images.append(reclist)
+            new_tracked.append((line, resizedimg, "center"))
+            self._update_archive_entry(line, resizedimg)
+
+        self.pdf_images = new_pdf_images
+        self.tracked_images = [r for r in self.tracked_images if r[0] not in line_to_rec.keys()]
+        self.tracked_images.extend(new_tracked)
+        self.status_text.set("All document PDF/JPG images resized, no copies.")
+        self.on_editor_change()
+
+    def launch_pdf_resize(self, index):
+        reclist = self.pdf_images[index]
+        imgobj = reclist[3]
+        line = reclist[2]
+
+        def onresize(resizedimg):
+            self._delete_editor_line_image_only(line)
+            imgtk = ImageTk.PhotoImage(resizedimg)
+            self.tk_images.append(imgtk)
+            indexstr = f"{line}.0"
+            self.text.image_create(indexstr, image=imgtk)
+            reclist[3] = resizedimg
+            self.tracked_images = [r for r in self.tracked_images if r[0] != line]
+            self.tracked_images.append((line, resizedimg, "center"))
+            self._update_archive_entry(line, resizedimg)
+            self.status_text.set("Selected document PDF/JPG image resized single, no copies.")
+            self.on_editor_change()
+
+        ResizeImageWindow(self, imgobj, onresize, title="Resize Document Image", enable_reupload=True).focus()
+
+    def resize_doc(self):
+        imgs = [i for i, item in enumerate(self.docs_images) if item[0] == "img"]
+        if not imgs:
+            messagebox.showinfo("Info", "No Add Docs images to resize or delete.")
+            return
+
+        choicewin = tk.Toplevel(self)
+        choicewin.title("Add Docs Actions")
+        choicewin.configure(bg="#23242e")
+        tk.Label(choicewin, text="Choose action for Add Docs pages", bg="#23242e", fg="white", font=("Arial", 10, "bold")).pack(padx=10, pady=(10, 5))
+        choicevar = tk.StringVar(value="resize")
+        tk.Radiobutton(choicewin, text="Resize pages", value="resize", variable=choicevar, bg="#23242e", fg="white", selectcolor="#23242e").pack(anchor="w", padx=15, pady=2)
+        tk.Radiobutton(choicewin, text="Delete pages", value="delete", variable=choicevar, bg="#23242e", fg="white", selectcolor="#23242e").pack(anchor="w", padx=15, pady=2)
+
+        def onokchoice():
+            choicewin.destroy()
+
+        tk.Button(choicewin, text="OK", command=onokchoice, bg="#006bce", fg="white").pack(pady=8)
+        choicewin.transient(self)
+        choicewin.grab_set()
+        self.wait_window(choicewin)
+
+        if choicevar.get() == "resize":
+            dialog = ImageSelectDialog(self, imgs, title="Resize Add Docs Images")
+            self.wait_window(dialog)
+            choice = dialog.result
+            if not choice:
+                return
+            choice = choice.strip().lower()
+            if choice == "all":
+                firstimg = self.docs_images[imgs[0]][3]
+                ResizeImageWindow(self, firstimg, self.resize_all_docs_keep_only_resized, title="Resize All Add Docs Images", bulk_option=True, enable_reupload=True).focus()
+            else:
+                try:
+                    selectedidx = int(choice.split()[-1]) - 1
+                    if selectedidx in imgs:
+                        self.launch_doc_resize(selectedidx)
+                    else:
+                        messagebox.showerror("Error", f"Image {selectedidx + 1} not found.")
+                except Exception:
+                    messagebox.showerror("Error", "Invalid selection!")
+        elif choicevar.get() == "delete":
+            pageinfos = []
+            for rec in self.docs_images:
+                if rec[0] == "img" and rec[3] is not None:
+                    pageinfos.append({"rec": rec, "line": rec[2]})
+            if not pageinfos:
+                messagebox.showinfo("Info", "No Add Docs pages available to delete.")
+                return
+            dlg = DeletePagesDialog(self, pageinfos, title="Delete Add Docs Pages")
+            self.wait_window(dlg)
+            idxs = dlg.result_indices
+            if not idxs:
+                return
+            lines_to_remove = set()
+            new_docs_images = []
+            for i, info in enumerate(pageinfos):
+                if i in idxs:
+                    lines_to_remove.add(info["line"])
+                else:
+                    new_docs_images.append(info["rec"])
+            self.docs_images = new_docs_images
+            self._remove_lines_everywhere(lines_to_remove)
+            self.status_text.set(f"Deleted {len(lines_to_remove)} Add Docs pages.")
+            self.on_editor_change()
+
+    def resize_all_docs_keep_only_resized(self, width, height):
+        line_to_rec = {}
+        for reclist in self.docs_images:
+            if reclist[0] == "img" and reclist[3] is not None:
+                line_to_rec[reclist[2]] = reclist
+
+        new_docs_images = []
+        new_tracked = []
+
+        for line, reclist in sorted(line_to_rec.items()):
+            self._delete_editor_line_image_only(line)
+            resizedimg = reclist[3].resize((width, height), Image.LANCZOS)
+            imgtk = ImageTk.PhotoImage(resizedimg)
+            self.tk_images.append(imgtk)
+            indexstr = f"{line}.0"
+            self.text.image_create(indexstr, image=imgtk)
+            reclist[3] = resizedimg
+            new_docs_images.append(reclist)
+            new_tracked.append((line, resizedimg, "center"))
+            self._update_archive_entry(line, resizedimg)
+
+        self.docs_images = new_docs_images
+        self.tracked_images = [r for r in self.tracked_images if r[0] not in line_to_rec.keys()]
+        self.tracked_images.extend(new_tracked)
+        self.status_text.set("All Add Docs images resized, no copies.")
+        self.on_editor_change()
+
+    def launch_doc_resize(self, index):
+        reclist = self.docs_images[index]
+        line = reclist[2]
+        imgobj = reclist[3]
+
+        def onresize(resizedimg):
+            self._delete_editor_line_image_only(line)
+            imgtk = ImageTk.PhotoImage(resizedimg)
+            self.tk_images.append(imgtk)
+            indexstr = f"{line}.0"
+            self.text.image_create(indexstr, image=imgtk)
+            reclist[3] = resizedimg
+            self.tracked_images = [r for r in self.tracked_images if r[0] != line]
+            self.tracked_images.append((line, resizedimg, "center"))
+            self._update_archive_entry(line, resizedimg)
+            self.status_text.set("Add Docs image resized single, no copies.")
+            self.on_editor_change()
+
+        ResizeImageWindow(self, imgobj, onresize, title="Resize Add Docs Image", enable_reupload=True).focus()
+
+    def extract_tc(self):
+        filepath = filedialog.askopenfilename(title="Select GEM Tender PDF", filetypes=[("PDF Files", "*.pdf")])
+        if not filepath:
+            return
+        self.status_text.set(f"Reading {os.path.basename(filepath)} ...")
+        try:
+            with pdfplumber.open(filepath) as pdf:
+                startmarker = "Buyer Added Bid Specific Terms and Conditions"
+                endmarker = "Disclaimer"
+                capture = False
+                headinginserted = False
+                self.text.delete("1.0", tk.END)
+                self.tc_source_file = self._source_file_key(filepath)
+                self.tc_line_source = {}
+                self.tc_source_ranges = {}
+                self.pdf_slide_source = {}
+
+                for pdf_page_number, page in enumerate(pdf.pages, start=1):
+                    pagetext = page.extract_text() or ""
+                    if not pagetext:
+                        continue
+                    lines = pagetext.splitlines()
+                    chars = page.chars
+
+                    linesbyy = {}
+                    for ch in chars:
+                        y = round(ch["top"], 1)
+                        linesbyy.setdefault(y, []).append(ch)
+
+                    boldlines = set()
+                    for _, chlist in linesbyy.items():
+                        boldcount = sum(1 for c in chlist if "Bold" in c.get("fontname", ""))
+                        if boldcount and boldcount / len(chlist) >= 0.6:
+                            texthere = "".join(c["text"] for c in chlist).strip()
+                            if texthere:
+                                boldlines.add(texthere)
+
+                    page_tc_start = None
+                    page_tc_had_content = False
+
+                    for rawline in lines:
+                        line = rawline.strip()
+                        if startmarker in line:
+                            capture = True
+                            if not headinginserted:
+                                self.text.insert(tk.END, "\n")
+                                hstart = self.text.index("end-1c")
+                                self.text.insert(tk.END, startmarker)
+                                hend = self.text.index("end-1c")
+                                self.text.tag_add("bold", hstart, hend)
+                                if page_tc_start is None:
+                                    page_tc_start = hstart
+                                    page_tc_had_content = True
+                                self.text.insert(tk.END, "\n")
+                                headinginserted = True
+                            continue
+
+                        if capture and endmarker in line:
+                            capture = False
+                            break
+
+                        if not capture:
+                            continue
+                        if is_probable_page_number(line):
+                            continue
+                        if not line:
+                            continue
+                        if is_garbage(line):
+                            continue
+
+                        isboldheading = False
+                        for b in boldlines:
+                            if line.startswith(b) or b.startswith(line):
+                                isboldheading = True
+                                break
+
+                        if isboldheading:
+                            self.text.insert(tk.END, "\n")
+                            startidx = self.text.index("end-1c")
+                            self.text.insert(tk.END, line)
+                            endidx = self.text.index("end-1c")
+                            self.text.tag_add("bold", startidx, endidx)
+                            if page_tc_start is None:
+                                page_tc_start = startidx
+                            page_tc_had_content = True
+                            self.text.insert(tk.END, "\n")
+                        else:
+                            startidx = self.text.index("end-1c")
+                            self.text.insert(tk.END, line + "\n")
+                            endidx = self.text.index("end-1c")
+                            if page_tc_start is None:
+                                page_tc_start = startidx
+                            page_tc_had_content = True
+
+                    if page_tc_had_content and page_tc_start is not None:
+                        page_tc_end = self.text.index("end-1c")
+                        self._mark_tc_text_range(page_tc_start, page_tc_end, self.tc_source_file, pdf_page_number)
+
+            self.status_text.set("Terms & Conditions extracted.")
+            messagebox.showinfo("Success", "Terms & Conditions extracted successfully.")
+            self.on_editor_change()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to read PDF:\n{e}")
+            self.status_text.set("Error reading PDF.")
+
+    def build_story_and_preview_source_map(self):
+        styles = getSampleStyleSheet()
+
+        def heading_style(sz):
+            return ParagraphStyle(
+                name=f"TCHeading{sz}",
+                parent=styles["Heading2"],
+                alignment=TA_CENTER,
+                fontName=self.bold_font_name,
+                fontSize=sz,
+                spaceAfter=6,
+                spaceBefore=12
+            )
+
+        def normal_style(sz):
+            return ParagraphStyle(
+                name=f"TCLine{sz}",
+                parent=styles["Normal"],
+                fontName=self.font_name,
+                fontSize=sz,
+                leading=sz + 3,
+                spaceBefore=4,
+                spaceAfter=2,
+                alignment=TA_LEFT
+            )
+
+        frame_left = 40
+        content_top_offset = 160
+        footer_safe_height = 120
+        frame_width = A4[0] - frame_left - 40
+        frame_height = A4[1] - content_top_offset - self.page_margin_bottom - footer_safe_height
+
+        elems = []
+        preview_source_map = []
+
+        total_lines = int(self.text.index("end-1c").split('.')[0])
+        images_by_line = {}
+        for line, pilimg, align in self.tracked_images:
+            images_by_line.setdefault(line, []).append((pilimg, align))
+        tables_by_line = self._table_records_by_line()
+
+        usablew = frame_width * 0.95
+        usableh = frame_height * 0.85
+        page_started = False
+        current_page_sources = []
+
+        def ensure_page_started():
+            nonlocal page_started
+            if not page_started:
+                page_started = True
+
+        def finish_current_page():
+            nonlocal page_started, current_page_sources
+            if page_started:
+                preview_source_map.append({"sources": list(current_page_sources)})
+                current_page_sources = []
+                page_started = False
+
+        def apply_manual_page_break_if_needed(line_no):
+            """Honor the user's manual 'next page' marker without forcing
+            ordinary text onto a new page when there is still usable space."""
+            nonlocal page_started
+            if self._line_has_tag(line_no, self.manual_page_break_tag):
+                if page_started:
+                    finish_current_page()
+                    elems.append(PageBreak())
+                else:
+                    # If this is already the first content on a page, there is
+                    # nothing to break before.
+                    pass
+
+        i = 1
+        while i <= total_lines:
+            linetext = self.text.get(f"{i}.0", f"{i}.0 lineend").strip()
+            tags = self.text.tag_names(f"{i}.0")
+
+            if i in tables_by_line:
+                apply_manual_page_break_if_needed(i)
+
+                # Tables now use normal ReportLab flow. They are allowed to
+                # remain on the current page when there is enough space.
+                table_rec = tables_by_line[i]
+                rows = int(table_rec.get("rows", 1))
+                cols = int(table_rec.get("cols", 1))
+                widget = table_rec.get("widget")
+                raw_data = widget.get_data() if widget is not None else []
+                if widget is not None and hasattr(widget, "get_pdf_col_widths"):
+                    col_widths = widget.get_pdf_col_widths(frame_width * 0.95)
+                else:
+                    col_widths = [frame_width * 0.95 / max(cols, 1)] * cols
+
+                data = []
+                for rr in range(rows):
+                    row_data = []
+                    for cc in range(cols):
+                        value = ""
+                        if rr < len(raw_data) and cc < len(raw_data[rr]):
+                            value = str(raw_data[rr][cc])
+                        safe_value = (
+                            value.replace("&", "&amp;")
+                                 .replace("<", "&lt;")
+                                 .replace(">", "&gt;")
+                                 .replace("\n", "<br/>")
+                        )
+                        wrap = True if widget is None else widget.cell_wraps(rr, cc)
+                        if wrap:
+                            cell_style = ParagraphStyle(
+                                name=f"TableCell_{i}_{rr}_{cc}",
+                                parent=styles["Normal"], fontName=self.font_name, fontSize=9,
+                                leading=11, textColor=colors.HexColor("#111827"),
+                                alignment=TA_LEFT, spaceBefore=0, spaceAfter=0
+                            )
+                            row_data.append(Paragraph(safe_value, cell_style))
+                        else:
+                            row_data.append(value)
+                    data.append(row_data)
+
+                rl_table = Table(data, colWidths=col_widths, hAlign="CENTER")
+                rl_table.setStyle(TableStyle([
+                    ("GRID", (0, 0), (-1, -1), 0.8, colors.HexColor("#4b5563")),
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eef2f7")),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                    ("TOPPADDING", (0, 0), (-1, -1), 5),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ]))
+
+                ensure_page_started()
+                table_source = {"type": "table", "line": i, "rows": rows, "cols": cols}
+                current_page_sources.append(table_source)
+                elems.append(Spacer(1, 8))
+                elems.append(rl_table)
+                elems.append(Spacer(1, 8))
+
+                i += 1
+                continue
+
+            if i in images_by_line:
+                # Pasted PDF/image slides retain their existing dedicated-page
+                # behavior. Ordinary text before/after them is not affected.
+                if page_started:
+                    finish_current_page()
+                    elems.append(PageBreak())
+
+                ensure_page_started()
+
+                for pilimg, aligntag in images_by_line[i]:
+                    imgpath, realw, realh = self._cache_image_once(pilimg)
+                    ratio = min(usablew / realw, usableh / realh, 0.95)
+                    imgw = realw * ratio
+                    imgh = realh * ratio
+                    rlimg = RLImage(imgpath, width=imgw, height=imgh)
+                    rlimg.hAlign = (
+                        aligntag.upper()
+                        if aligntag in ("left", "right", "center")
+                        else "CENTER"
+                    )
+                    rlimg._restrictSize(usablew, usableh)
+                    elems.append(Spacer(1, 6))
+                    elems.append(rlimg)
+                    elems.append(Spacer(1, 6))
+
+                    pdf_slide_id = None
+                    for pdf_rec in self.pdf_images:
+                        if pdf_rec[0] == "img" and len(pdf_rec) >= 7 and pdf_rec[3] is pilimg:
+                            pdf_slide_id = pdf_rec[6]
+                            break
+
+                    source_info = {"type": "image", "line": i}
+                    if pdf_slide_id is not None:
+                        source_info["type"] = "pdf_slide"
+                        source_info["pdf_slide_id"] = pdf_slide_id
+                        slide_source = self.pdf_slide_source.get(pdf_slide_id)
+                        if slide_source:
+                            source_info["tc_source"] = [slide_source[0], slide_source[1]]
+
+                    current_page_sources.append(source_info)
+                    elems.append(_PreviewSourceMarker(source_info))
+
+                finish_current_page()
+                elems.append(PageBreak())
+                i += 1
+                continue
+
+            if linetext:
+                apply_manual_page_break_if_needed(i)
+                ensure_page_started()
+
+                size = 12
+                for tag in tags:
+                    if tag.startswith("size"):
+                        try:
+                            size = int(tag.replace("size", ""))
+                        except Exception:
+                            pass
+
+                if "heading" in tags:
+                    style = heading_style(size)
+                else:
+                    style = normal_style(size)
+
+                if "center" in tags:
+                    style.alignment = TA_CENTER
+                elif "right" in tags:
+                    style.alignment = TA_RIGHT
+                else:
+                    style.alignment = TA_LEFT
+
+                if "bold" in tags:
+                    style.fontName = self.bold_font_name
+
+                # Preserve underline in the actual PDF/preview. Tkinter keeps
+                # the underline as a text tag; ReportLab needs <u> markup.
+                pdf_text = xml_escape(linetext)
+                if self._line_has_tag(i, "underline"):
+                    pdf_text = f"<u>{pdf_text}</u>"
+
+                text_source = {"type": "text", "line": i}
+                tc_sources = self._get_tc_sources_for_line(i)
+                if tc_sources:
+                    text_source["tc_sources"] = [[src[0], src[1]] for src in tc_sources]
+
+                elems.append(_SourceParagraph(pdf_text, style, source=text_source))
+                current_page_sources.append(text_source)
+
+            i += 1
+
+        finish_current_page()
+
+        while elems and isinstance(elems[-1], PageBreak):
+            elems.pop()
+        while preview_source_map and not preview_source_map[-1]["sources"]:
+            preview_source_map.pop()
+
+        return elems, preview_source_map, frame_left, frame_width, frame_height
+
+    def pdf_preview_render(self, outputfile="previewtemp.pdf", showmessage=True):
+        elems, preview_source_map, frame_left, frame_width, frame_height = self.build_story_and_preview_source_map()
+        self.preview_source_map = preview_source_map
+
+        if not elems:
+            open(outputfile, "wb").close()
+            self.preview_source_map = []
+            self.preview_total_pages = 0
+            return
+
+        frame_margin_bottom = self.page_margin_bottom + 120
+        frame = Frame(frame_left, frame_margin_bottom, frame_width, frame_height, id="bodyframe")
+        template = PageTemplate(id="gematc", frames=[frame], onPage=self.on_page)
+        doc = _SourceTrackingDocTemplate(
+            outputfile, pagesize=A4, pageTemplates=[template]
+        )
+        doc.build(elems)
+
+        # The old estimate counted editor lines, not wrapped PDF paragraphs.
+        # Use ReportLab's actual page numbers so Page 3 always maps to PDF Page 3.
+        # Read the finished PDF for the authoritative page count. ReportLab's
+        # internal ``doc.page`` can differ from the final PDF count in edge cases
+        # involving page breaks, so it must not be the validation source for the UI.
+        try:
+            with pdfplumber.open(outputfile) as rendered_pdf:
+                actual_page_count = len(rendered_pdf.pages)
+        except Exception:
+            actual_page_count = max(int(getattr(doc, "page", 0) or 0), 0)
+
+        actual_source_map = []
+        for page_no in range(1, actual_page_count + 1):
+            actual_source_map.append({
+                "sources": list(doc.page_sources.get(page_no, []))
+            })
+        self.preview_source_map = actual_source_map
+        self.preview_total_pages = actual_page_count
+
+        if showmessage:
+            self.status_text.set(f"PDF exported {outputfile}")
+
+    def on_page(self, canvas, doc):
+        pdfwidth, pdfheight = A4
+
+        # Page-specific header/footer removal. The page number here is the final
+        # ReportLab page number, so the user's 6,7 selection maps exactly to PDF 6,7.
+        if self._should_hide_header_footer(doc.page):
+            return
+
+        if self.header_img_resized is not None:
+            imgwidth, imgheight = self.header_img_resized.size
+            availablewidth = pdfwidth - 100
+            scale = min(availablewidth / imgwidth, 1.0)
+            scaledwidth = int(imgwidth * scale)
+            scaledheight = int(imgheight * scale)
+            xpos = (pdfwidth - scaledwidth) / 2
+            ypos = pdfheight - scaledheight - 20
+            canvas.drawImage(ImageReader(self.header_img_resized), xpos, ypos, width=scaledwidth, height=scaledheight, preserveAspectRatio=True)
+
+        if self.footer_img_resized is not None:
+            imgwidth, imgheight = self.footer_img_resized.size
+            availablewidth = pdfwidth - 100
+            scale = min(availablewidth / imgwidth, 1.0)
+            scaledwidth = int(imgwidth * scale)
+            scaledheight = int(imgheight * scale)
+            xpos = 40
+            ypos = self.page_margin_bottom
+            canvas.drawImage(ImageReader(self.footer_img_resized), xpos, ypos, width=scaledwidth, height=scaledheight, preserveAspectRatio=True)
+
+    def clear_all(self):
+        self.text.delete("1.0", tk.END)
+        self.doc_list = []
+        self.tk_images = []
+        self.tracked_images = []
+        self.pdf_images = []
+        self.docs_images = []
+        self.image_archive = []
+        self.header_img_resized = None
+        self.footer_img_resized = None
+        self.header_footer_removed_pages = set()
+        self.table_records = {}
+        self.last_cursor_pos = "1.0"
+        self.status_text.set("Document cleared.")
+        self.text_sizes = {}
+        self.fast_img_cache.clear()
+        self.preview_cache.clear()
+        self.preview_rendered_pages.clear()
+        self.preview_total_pages = 0
+        self.preview_pdf_path = None
+        self.preview_source_map = []
+        self.preview_removed_indices = set()
+        self.preview_removed_pages = []
+        self.preview_removal_log = []
+        self.preview_layout = []
+        self.preview_page_objects = {}
+        self.preview_generation_id += 1
+
+        if self.temp_dir and os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+        self.temp_dir = tempfile.mkdtemp()
+        self.clear_preview_panel()
+
+    def clear_preview_panel(self):
+        self.preview_canvas.delete("all")
+        self.preview_canvas.configure(scrollregion=(0, 0, 0, 0))
+        self.page_info_var.set("Pages: 0")
+        self._update_removed_pages_label()
+        self.preview_cache = {}
+        self.preview_rendered_pages = set()
+        self.preview_layout = []
+        self.preview_page_objects = {}
+
+    def _update_removed_pages_label(self):
+        """Refresh the permanent removal history shown below PDF Preview."""
+        if not getattr(self, "preview_removed_pages", None):
+            self.removed_pages_var.set("Removed pages: None")
+            return
+        pages = ", ".join(str(p) for p in self.preview_removed_pages)
+        self.removed_pages_var.set(f"Removed pages: {pages}")
+
+    def _record_removed_preview_pages(self, page_numbers, source_count=0, line_count=0):
+        """Record exactly which preview page numbers the user removed."""
+        for page_no in sorted(set(int(p) for p in page_numbers)):
+            if page_no not in self.preview_removed_pages:
+                self.preview_removed_pages.append(page_no)
+        self.preview_removed_pages.sort()
+        self.preview_removal_log.append({
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "pages": sorted(set(int(p) for p in page_numbers)),
+            "source_count": int(source_count),
+            "line_count": int(line_count),
+        })
+        self._update_removed_pages_label()
+
+    def manual_preview_click(self):
+        if not PDF2IMAGE_AVAILABLE:
+            messagebox.showwarning("Preview disabled", "Live preview ke liye pdf2image + poppler chahiye. sirf Export to PDF ka use karein.")
+            return
+        if self.preview_thread and self.preview_thread.is_alive():
+            messagebox.showinfo("Preview", "Preview already running, please wait.")
+            return
+        self.progress.config(mode="determinate")
+        self.progress_var.set(0)
+        self.wait_label.config(text="Generating preview, please wait...")
+        self.status_text.set("Generating preview PDF...")
+        self.preview_thread = Thread(target=self._preview_worker, daemon=True)
+        self.preview_thread.start()
+
+    def _preview_worker(self):
+        tmppdf = os.path.join(self.temp_dir, "livepreview.pdf")
+        generation = self.preview_generation_id + 1
+        self.preview_generation_id = generation
+        try:
+            self.pdf_preview_render(tmppdf, showmessage=False)
+            if not os.path.exists(tmppdf) or os.path.getsize(tmppdf) == 0:
+                self.after(0, self.handle_no_preview_content)
+                return
+
+            with pdfplumber.open(tmppdf) as pdf:
+                totalpages = len(pdf.pages)
+
+            self.preview_pdf_path = tmppdf
+            self.preview_total_pages = totalpages
+            self.preview_removed_indices = set()
+
+            self.after(0, lambda: self._setup_preview_canvas(totalpages, generation))
+        except Exception as e:
+            def showerr():
+                self.status_text.set("Error while generating preview.")
+                messagebox.showerror("Preview Error", f"Preview failed:\n{e}")
+                self.progress_var.set(0)
+                self.wait_label.config(text="")
+            self.after(0, showerr)
+
+    def handle_no_preview_content(self):
+        self.clear_preview_panel()
+        self.status_text.set("No content to preview.")
+        self.page_info_var.set("Pages: 0")
+        self.progress_var.set(0)
+        self.wait_label.config(text="")
+
+    def _setup_preview_canvas(self, totalpages, generation):
+        if generation != self.preview_generation_id:
+            return
+
+        self.clear_preview_panel()
+        self.page_info_var.set(f"Pages: {totalpages}")
+        self._update_removed_pages_label()
+        self.status_text.set("Preview ready.")
+        self.progress_var.set(100)
+        self.wait_label.config(text="")
+        self.update_idletasks()
+
+        canvasw = max(360, self.preview_canvas.winfo_width())
+        pagew = max(260, min(500, canvasw - 30))
+        self.preview_target_width = pagew
+
+        y = 12
+        self.preview_layout = []
+        self.preview_page_objects = {}
+
+        visible_pages = [p for p in range(1, totalpages + 1) if p not in self.preview_removed_indices]
+
+        for display_index, pageno in enumerate(visible_pages, start=1):
+            labely = y
+            imgy = labely + 24
+            approxh = int(pagew * 1.4142)
+
+            self.preview_canvas.create_text(
+                10, labely,
+                anchor="nw",
+                text=f"Page {pageno} / {totalpages}",
+                fill="#a5b4fc",
+                font=("Arial", 10, "bold"),
+                tags=(f"page_label_{pageno}",)
+            )
+
+            rectid = self.preview_canvas.create_rectangle(
+                10, imgy, 10 + pagew, imgy + approxh,
+                outline="#334155", fill="#0f172a", width=1,
+                tags=(f"page_rect_{pageno}",)
+            )
+
+            loadingid = self.preview_canvas.create_text(
+                10 + pagew / 2, imgy + approxh / 2,
+                text="Loading preview...",
+                fill="#93c5fd",
+                font=("Arial", 10, "italic"),
+                tags=(f"page_loading_{pageno}",)
+            )
+
+            info = {
+                "page_no": pageno,
+                "top": labely,
+                "img_top": imgy,
+                "left": 10,
+                "width": pagew,
+                "height": approxh,
+                "bottom": imgy + approxh + 16,
+                "rect_id": rectid,
+                "loading_id": loadingid,
+                "image_id": None
+            }
+            self.preview_layout.append(info)
+            self.preview_page_objects[pageno] = info
+            y = imgy + approxh + 28
+
+        self.preview_canvas.configure(scrollregion=(0, 0, canvasw, y + 20))
+        self._schedule_preview_visible_render()
+
+    def _schedule_preview_visible_render(self):
+        if self.preview_update_after:
+            try:
+                self.after_cancel(self.preview_update_after)
+            except Exception:
+                pass
+        self.preview_update_after = self.after(60, self._render_visible_preview_pages)
+
+    def _render_visible_preview_pages(self):
+        self.preview_update_after = None
+        if not self.preview_pdf_path or not self.preview_layout or self.preview_loading:
+            return
+
+        top = self.preview_canvas.canvasy(0)
+        bottom = top + self.preview_canvas.winfo_height()
+
+        pages_to_render = []
+        for info in self.preview_layout:
+            if info["bottom"] >= top - 300 and info["top"] <= bottom + 300:
+                if info["page_no"] not in self.preview_rendered_pages:
+                    pages_to_render.append(info["page_no"])
+
+        if not pages_to_render:
+            return
+
+        self.preview_loading = True
+        generation = self.preview_generation_id
+
+        def worker():
+            try:
+                for page_no in pages_to_render:
+                    if generation != self.preview_generation_id:
+                        return
+                    self._render_one_preview_page(page_no, generation)
+            finally:
+                self.preview_loading = False
+
+        Thread(target=worker, daemon=True).start()
+
+    def _render_one_preview_page(self, page_no, generation):
+        with self.preview_lock:
+            if page_no in self.preview_rendered_pages:
+                return
+
+            kwargs = {
+                "dpi": 115,
+                "first_page": page_no,
+                "last_page": page_no,
+                "fmt": "ppm",
+                "thread_count": 1
+            }
+            if POPPLER_PATH:
+                kwargs["poppler_path"] = POPPLER_PATH
+
+            pages = convert_from_path(self.preview_pdf_path, **kwargs)
+            if not pages:
+                return
+
+            img = pages[0].convert("RGB")
+            w, h = img.size
+            target_w = self.preview_target_width
+            target_h = int(h * target_w / w)
+            resized = img.resize((target_w, target_h), Image.LANCZOS)
+            tkimg = ImageTk.PhotoImage(resized)
+            self.preview_cache[page_no] = tkimg
+
+            self.after(0, lambda: self._place_preview_image(page_no, tkimg, target_h, generation))
+
+    def _place_preview_image(self, page_no, tkimg, target_h, generation):
+        if generation != self.preview_generation_id:
+            return
+
+        info = self.preview_page_objects.get(page_no)
+        if info is None:
+            return
+
+        left = info["left"]
+        img_top = info["img_top"]
+        width = info["width"]
+
+        self.preview_canvas.coords(info["rect_id"], left, img_top, left + width, img_top + target_h)
+        self.preview_canvas.delete(info["loading_id"])
+
+        if info["image_id"] is not None:
+            self.preview_canvas.delete(info["image_id"])
+
+        image_id = self.preview_canvas.create_image(left, img_top, anchor="nw", image=tkimg, tags=(f"page_img_{page_no}",))
+        info["image_id"] = image_id
+        info["height"] = target_h
+        info["bottom"] = img_top + target_h + 16
+
+        self.preview_rendered_pages.add(page_no)
+        self._reflow_preview_layout_from(page_no)
+
+    def _reflow_preview_layout_from(self, start_page_no):
+        start_index = None
+        for idx, item in enumerate(self.preview_layout):
+            if item["page_no"] == start_page_no:
+                start_index = idx
+                break
+        if start_index is None:
+            return
+
+        if start_index == 0:
+            y = 12
+        else:
+            y = self.preview_layout[start_index - 1]["bottom"] + 12
+
+        for idx in range(start_index, len(self.preview_layout)):
+            item = self.preview_layout[idx]
+            label_y = y
+            img_y = label_y + 24
+
+            item["top"] = label_y
+            item["img_top"] = img_y
+            item["bottom"] = img_y + item["height"] + 16
+
+            self.preview_canvas.coords(f"page_label_{item['page_no']}", 10, label_y)
+            self.preview_canvas.coords(item["rect_id"], 10, img_y, 10 + item["width"], img_y + item["height"])
+
+            if item["image_id"] is not None:
+                self.preview_canvas.coords(item["image_id"], 10, img_y)
+
+            y = item["bottom"] + 12
+
+        self.preview_canvas.configure(scrollregion=(0, 0, max(360, self.preview_canvas.winfo_width()), y + 20))
+
+    def _preview_scroll_command(self, *args):
+        self.preview_canvas.yview(*args)
+        self._schedule_preview_visible_render()
+
+    def _on_preview_canvas_resize(self, event=None):
+        if not self.preview_layout:
+            return
+
+        canvasw = max(360, self.preview_canvas.winfo_width())
+        new_page_w = max(260, min(500, canvasw - 30))
+
+        if abs(new_page_w - self.preview_target_width) < 5:
+            self._schedule_preview_visible_render()
+            return
+
+        self.preview_target_width = new_page_w
+        self.preview_cache.clear()
+        self.preview_rendered_pages.clear()
+
+        self.preview_canvas.delete("all")
+        totalpages = self.preview_total_pages
+        self.preview_layout = []
+        self.preview_page_objects = {}
+
+        y = 12
+        visible_pages = [p for p in range(1, totalpages + 1) if p not in self.preview_removed_indices]
+
+        for pageno in visible_pages:
+            labely = y
+            imgy = labely + 24
+            approxh = int(new_page_w * 1.4142)
+
+            self.preview_canvas.create_text(
+                10, labely, anchor="nw",
+                text=f"Page {pageno} / {totalpages}",
+                fill="#a5b4fc", font=("Arial", 10, "bold"),
+                tags=(f"page_label_{pageno}",)
+            )
+
+            rectid = self.preview_canvas.create_rectangle(
+                10, imgy, 10 + new_page_w, imgy + approxh,
+                outline="#334155", fill="#0f172a", width=1,
+                tags=(f"page_rect_{pageno}",)
+            )
+
+            loadingid = self.preview_canvas.create_text(
+                10 + new_page_w / 2, imgy + approxh / 2,
+                text="Loading preview...",
+                fill="#93c5fd", font=("Arial", 10, "italic"),
+                tags=(f"page_loading_{pageno}",)
+            )
+
+            info = {
+                "page_no": pageno,
+                "top": labely,
+                "img_top": imgy,
+                "left": 10,
+                "width": new_page_w,
+                "height": approxh,
+                "bottom": imgy + approxh + 16,
+                "rect_id": rectid,
+                "loading_id": loadingid,
+                "image_id": None
+            }
+            self.preview_layout.append(info)
+            self.preview_page_objects[pageno] = info
+            y = imgy + approxh + 28
+
+        self.preview_canvas.configure(scrollregion=(0, 0, canvasw, y + 20))
+        self._schedule_preview_visible_render()
+
+    def _on_preview_mousewheel(self, event):
+        self.preview_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self._schedule_preview_visible_render()
+
+    def _on_preview_mousewheel_linux(self, event):
+        if event.num == 4:
+            self.preview_canvas.yview_scroll(-3, "units")
+        elif event.num == 5:
+            self.preview_canvas.yview_scroll(3, "units")
+        self._schedule_preview_visible_render()
+
+    def _parse_page_input(self, textvalue, maxpage):
+        pages = set()
+        textvalue = textvalue.strip()
+        if not textvalue:
+            return pages
+
+        for chunk in textvalue.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if "-" in chunk:
+                parts = chunk.split("-")
+                if len(parts) != 2:
+                    continue
+                try:
+                    start = int(parts[0].strip())
+                    end = int(parts[1].strip())
+                    if start > end:
+                        start, end = end, start
+                    for p in range(start, end + 1):
+                        if 1 <= p <= maxpage:
+                            pages.add(p)
+                except Exception:
+                    pass
+            else:
+                try:
+                    p = int(chunk)
+                    if 1 <= p <= maxpage:
+                        pages.add(p)
+                except Exception:
+                    pass
+
+        return pages
+
+    def _remove_line_text_content(self, line):
+        try:
+            line_start = f"{line}.0"
+            line_end = f"{line}.0 lineend"
+            existing = self.text.get(line_start, line_end)
+            if existing is not None and existing != "":
+                self.text.delete(line_start, line_end)
+        except Exception:
+            pass
+
+    def _image_name_at_line(self, line):
+        """Return the Tk Text image name currently stored on a line."""
+        try:
+            for image_name in self.text.image_names():
+                idx = self.text.index(image_name)
+                if int(idx.split(".")[0]) == int(line):
+                    return image_name
+        except Exception:
+            pass
+        return None
+
+    def _sync_image_records_after_text_change(self, image_snapshot=None):
+        """Rebuild image line numbers after Text widget lines have shifted.
+
+        Tkinter Text line numbers are NOT stable after a deletion.  The old
+        implementation kept stale line numbers, which caused Preview to be
+        rebuilt from the wrong image records.  Image names, however, remain
+        attached to the actual embedded image, so they are used as stable
+        identities here.
+        """
+        image_snapshot = image_snapshot or {}
+
+        current_names = set(self.text.image_names())
+        new_tracked = []
+        new_pdf = []
+        new_docs = []
+        new_archive = []
+
+        # Build a name -> current line map from the actual Text widget.
+        name_to_line = {}
+        for name in current_names:
+            try:
+                name_to_line[name] = int(self.text.index(name).split(".")[0])
+            except Exception:
+                pass
+
+        # Rebuild tracked_images using the stable Tk image name snapshot.
+        for name, meta in image_snapshot.items():
+            if name not in name_to_line:
+                continue
+            line = name_to_line[name]
+            pil_img = meta.get("img")
+            align = meta.get("align", "center")
+            if pil_img is not None:
+                new_tracked.append((line, pil_img, align))
+
+        # Rebuild PDF image records.  Preserve every field but replace the
+        # stale editor line number with the current line number.
+        for rec in self.pdf_images:
+            if not rec:
+                continue
+            name = rec[7] if len(rec) >= 8 else None
+            if name and name in name_to_line:
+                nr = list(rec)
+                nr[2] = name_to_line[name]
+                new_pdf.append(nr)
+            else:
+                # Legacy record: use the image object identity as fallback.
+                pil_img = rec[3] if len(rec) >= 4 else None
+                found_name = None
+                for snap_name, meta in image_snapshot.items():
+                    if meta.get("img") is pil_img and snap_name in name_to_line:
+                        found_name = snap_name
+                        break
+                if found_name is not None:
+                    nr = list(rec)
+                    nr[2] = name_to_line[found_name]
+                    if len(nr) < 8:
+                        nr.append(found_name)
+                    else:
+                        nr[7] = found_name
+                    new_pdf.append(nr)
+
+        # Rebuild Add Docs records in the same way.
+        for rec in self.docs_images:
+            if not rec:
+                continue
+            name = rec[6] if len(rec) >= 7 else None
+            if name and name in name_to_line:
+                nr = list(rec)
+                nr[2] = name_to_line[name]
+                new_docs.append(nr)
+            else:
+                pil_img = rec[3] if len(rec) >= 4 else None
+                found_name = None
+                for snap_name, meta in image_snapshot.items():
+                    if meta.get("img") is pil_img and snap_name in name_to_line:
+                        found_name = snap_name
+                        break
+                if found_name is not None:
+                    nr = list(rec)
+                    nr[2] = name_to_line[found_name]
+                    if len(nr) < 7:
+                        nr.append(found_name)
+                    else:
+                        nr[6] = found_name
+                    new_docs.append(nr)
+
+        self.tracked_images = new_tracked
+        self.pdf_images = new_pdf
+        self.docs_images = new_docs
+
+        # Rebuild the archive from the surviving actual images.
+        for name, meta in image_snapshot.items():
+            if name not in name_to_line:
+                continue
+            img = meta.get("img")
+            if img is None:
+                continue
+            line = name_to_line[name]
+            new_archive.append({
+                "id": id(img),
+                "line": line,
+                "img": img,
+                "width": img.size[0],
+                "height": img.size[1],
+                "title": self.title_for_line(line)
+            })
+        self.image_archive = new_archive
+
+    def _remove_lines_everywhere(self, lines_to_delete):
+        """Remove ONLY the requested editor lines and their embedded images.
+
+        This function deliberately does not remove an entire T&C source page.
+        Preview removal is page-local: whatever text/images are represented by
+        the selected preview page are removed, and unrelated content stays.
+        """
+        if not lines_to_delete:
+            return
+
+        lines_to_delete = set(int(x) for x in lines_to_delete)
+
+        # Snapshot stable Tk image names BEFORE deleting anything because line
+        # numbers will shift as soon as the first line is removed.
+        image_snapshot = {}
+        for image_name in list(self.text.image_names()):
+            try:
+                line = int(self.text.index(image_name).split(".")[0])
+                pil_img = None
+                align = "center"
+                for rec in self.pdf_images:
+                    if len(rec) >= 8 and rec[7] == image_name:
+                        pil_img = rec[3]
+                        align = rec[5] if len(rec) > 5 else "center"
+                        break
+                if pil_img is None:
+                    for rec in self.docs_images:
+                        if len(rec) >= 7 and rec[6] == image_name:
+                            pil_img = rec[3]
+                            align = rec[5] if len(rec) > 5 else "center"
+                            break
+                if pil_img is None:
+                    for line_no, img, a in self.tracked_images:
+                        if line_no == line:
+                            pil_img = img
+                            align = a
+                            break
+                image_snapshot[image_name] = {
+                    "line": line,
+                    "img": pil_img,
+                    "align": align
+                }
+            except Exception:
+                pass
+
+        # Delete bottom-to-top.  Delete the complete text line as well as the
+        # embedded image on that line.  Tags (including T&C source tags) move
+        # automatically with the surviving text.
+        for line in sorted(lines_to_delete, reverse=True):
+            try:
+                self._delete_editor_line_image_only(line)
+                start_idx = f"{line}.0"
+                end_idx = f"{line + 1}.0"
+                last_line = int(self.text.index("end-1c").split(".")[0])
+                if line < last_line:
+                    self.text.delete(start_idx, end_idx)
+                else:
+                    self.text.delete(start_idx, "end-1c")
+            except Exception:
+                try:
+                    self._remove_line_text_content(line)
+                except Exception:
+                    pass
+
+        self._sync_image_records_after_text_change(image_snapshot)
+        # Remove table metadata whose embedded window was deleted.
+        self._table_records_by_line()
+
+    def remove_pages_from_preview_input(self):
+        # Synchronize against the PDF currently shown in the preview BEFORE
+        # validating input. The old implementation trusted an approximate source
+        # map and could reject the last visible page (e.g. page 3 of 3).
+        actual_pages = None
+        if self.preview_pdf_path and os.path.exists(self.preview_pdf_path):
+            try:
+                with pdfplumber.open(self.preview_pdf_path) as rendered_pdf:
+                    actual_pages = len(rendered_pdf.pages)
+                if (actual_pages != self.preview_total_pages or
+                        actual_pages != len(self.preview_source_map)):
+                    self.pdf_preview_render(self.preview_pdf_path, showmessage=False)
+                    # The source editor may have changed since the previous preview;
+                    # use the newly rendered PDF's page count and source map.
+                    actual_pages = self.preview_total_pages
+            except Exception as exc:
+                self.status_text.set(f"Preview page count could not be checked: {exc}")
+
+        if actual_pages is None:
+            actual_pages = max(
+                int(self.preview_total_pages or 0),
+                len(self.preview_source_map or [])
+            )
+
+        if actual_pages <= 0:
+            messagebox.showinfo("Info", "Pehle Preview PDF generate karein.")
+            return
+
+        # Never let a short source map make a visible PDF page appear invalid.
+        if len(self.preview_source_map) < actual_pages:
+            self.preview_source_map.extend(
+                {"sources": []}
+                for _ in range(actual_pages - len(self.preview_source_map))
+            )
+        self.preview_total_pages = actual_pages
+
+        txt = self.remove_page_entry.get().strip()
+        if not txt:
+            messagebox.showinfo(
+                "Info",
+                "Page number dalo. Example: 3 or 3,5,7 or 3-5."
+            )
+            return
+
+        pages_to_remove = self._parse_page_input(txt, actual_pages)
+        if not pages_to_remove:
+            messagebox.showerror(
+                "Invalid Page Number",
+                f"Valid preview page number/range dalo (1-{actual_pages}). "
+                "Example: 3 or 3,5-7."
+            )
+            return
+
+        self._remove_pages_by_preview_numbers(sorted(pages_to_remove))
+
+    def _remove_pages_by_preview_numbers(self, page_numbers):
+        """Permanently remove selected generated-preview pages.
+
+        The current preview_source_map is the bridge:
+            preview page -> editor line/image -> PDF slide/source.
+
+        We snapshot the selected sources before changing the Text widget because
+        Tkinter line numbers shift immediately after deletion.  We then delete
+        bottom-to-top and rebuild the preview from the surviving editor content.
+        """
+        requested_pages = sorted(set(int(p) for p in page_numbers if int(p) > 0))
+        if not requested_pages:
+            messagebox.showinfo("Info", "Valid preview page nahi mila.")
+            return
+
+        # The visible PDF page count is authoritative. If an old/stale map is
+        # shorter, refresh it from the currently displayed preview before deciding
+        # a page is invalid.
+        if self.preview_pdf_path and os.path.exists(self.preview_pdf_path):
+            try:
+                with pdfplumber.open(self.preview_pdf_path) as rendered_pdf:
+                    pdf_page_count = len(rendered_pdf.pages)
+                if (len(self.preview_source_map) != pdf_page_count or
+                        self.preview_total_pages != pdf_page_count):
+                    self.pdf_preview_render(self.preview_pdf_path, showmessage=False)
+                    pdf_page_count = self.preview_total_pages
+            except Exception:
+                pdf_page_count = max(len(self.preview_source_map), self.preview_total_pages)
+        else:
+            pdf_page_count = max(len(self.preview_source_map), self.preview_total_pages)
+
+        if len(self.preview_source_map) < pdf_page_count:
+            self.preview_source_map.extend(
+                {"sources": []}
+                for _ in range(pdf_page_count - len(self.preview_source_map))
+            )
+
+        valid_pages = [
+            p for p in requested_pages
+            if 1 <= p <= pdf_page_count
+        ]
+        invalid_pages = [p for p in requested_pages if p not in valid_pages]
+
+        if invalid_pages:
+            self.status_text.set(
+                "Invalid preview pages ignored: " +
+                ", ".join(str(p) for p in invalid_pages)
+            )
+
+        if not valid_pages:
+            messagebox.showinfo("Info", "Valid preview page nahi mila.")
+            return
+
+        selected_sources = []
+        lines_to_delete = set()
+
+        # Snapshot the exact sources represented by the selected preview pages.
+        for page_no in valid_pages:
+            pageinfo = self.preview_source_map[page_no - 1]
+            for src in pageinfo.get("sources", []):
+                selected_sources.append(dict(src))
+                line = src.get("line")
+                if line is not None:
+                    try:
+                        lines_to_delete.add(int(line))
+                    except (TypeError, ValueError):
+                        pass
+
+        # Deduplicate source records for the removal audit.
+        deduped_sources = []
+        seen_source_keys = set()
+        for src in selected_sources:
+            key = (
+                src.get("type"),
+                src.get("line"),
+                src.get("pdf_slide_id"),
+                tuple(src.get("tc_source", [])) if src.get("tc_source") else None,
+            )
+            if key not in seen_source_keys:
+                seen_source_keys.add(key)
+                deduped_sources.append(src)
+
+        if not lines_to_delete:
+            messagebox.showinfo(
+                "Info",
+                "Selected preview page me removable text/image/PDF content nahi mila."
+            )
+            return
+
+        # One operation removes both normal T&C text and embedded PDF slides.
+        self._remove_lines_everywhere(lines_to_delete)
+
+        try:
+            # Rebuild from the now-authoritative Text widget. Deleted content
+            # therefore cannot come back when Preview PDF is generated again.
+            self.preview_generation_id += 1
+            _, refreshed_source_map, _, _, _ = (
+                self.build_story_and_preview_source_map()
+            )
+            self.preview_source_map = refreshed_source_map
+            self.preview_total_pages = len(refreshed_source_map)
+
+            # The selected pages are physically gone; nothing remains to hide.
+            self.preview_removed_indices = set()
+
+            if self.preview_pdf_path:
+                self.pdf_preview_render(
+                    self.preview_pdf_path,
+                    showmessage=False
+                )
+
+            # Keep a permanent UI/audit record of the pages the user removed.
+            self._record_removed_preview_pages(
+                valid_pages,
+                source_count=len(deduped_sources),
+                line_count=len(lines_to_delete),
+            )
+
+            self._setup_preview_canvas(
+                self.preview_total_pages,
+                self.preview_generation_id
+            )
+
+        except Exception as e:
+            self.status_text.set("Page removed, but preview refresh failed.")
+            messagebox.showwarning(
+                "Preview Refresh",
+                f"Page remove ho gaya, lekin preview refresh nahi ho paya:\n{e}"
+            )
+            self.on_editor_change()
+            return
+
+        self.remove_page_entry.delete(0, tk.END)
+        removed_text = ", ".join(str(x) for x in valid_pages)
+        self.status_text.set(
+            f"Preview page(s) {removed_text} permanently removed from "
+            "Text Area, PDF slides and Preview."
+        )
+        self.on_editor_change()
+
+    def reset_removed_pages(self):
+        """Clear the removal-history display without restoring deleted content."""
+        self.remove_page_entry.delete(0, tk.END)
+        self.preview_removed_indices = set()
+        self.preview_removed_pages = []
+        self.preview_removal_log = []
+        self._update_removed_pages_label()
+
+        if self.preview_total_pages and self.preview_source_map:
+            self._setup_preview_canvas(
+                self.preview_total_pages,
+                self.preview_generation_id
+            )
+
+        self.status_text.set(
+            "Removal history cleared. Deleted content remains permanently removed."
+        )
+
+    def compress_and_save_pdf(self):
+        tmppdf = os.path.join(self.temp_dir, "compressbase.pdf")
+        try:
+            self.pdf_preview_render(tmppdf, showmessage=False)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to generate base PDF:\n{e}")
+            return
+
+        if not os.path.exists(tmppdf) or os.path.getsize(tmppdf) == 0:
+            messagebox.showinfo("Info", "No content to compress.")
+            return
+
+        savepath = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF Files", "*.pdf")], title="Save Compressed PDF")
+        if not savepath:
+            return
+
+        targetval = self.target_size_mb.get()
+        unit = self.target_size_unit.get()
+        if targetval <= 0:
+            messagebox.showerror("Error", "Target size must be > 0.")
+            return
+
+        targetbytes = int(targetval * 1024 * 1024) if unit == "MB" else int(targetval * 1024)
+
+        self.progress.config(mode="determinate")
+        self.progress_var.set(0)
+        self.wait_label.config(text="Compressing PDF, please wait...")
+        self.status_text.set("Trying to compress PDF near selected size...")
+        t = Thread(target=self._compress_worker, args=(tmppdf, savepath, targetbytes), daemon=True)
+        t.start()
+
+    def _compress_worker(self, srcpdf, dstpdf, targetbytes):
+        try:
+            from reportlab.pdfgen import canvas as rlcanvas
+            kwargs = {}
+            if POPPLER_PATH:
+                kwargs["poppler_path"] = POPPLER_PATH
+            pages = convert_from_path(srcpdf, dpi=150, **kwargs)
+            totalpages = len(pages) or 1
+            qualities = [95, 85, 75, 60, 50, 40, 30]
+            bestpath = None
+            bestsize = None
+
+            for qidx, q in enumerate(qualities, start=1):
+                tmpout = os.path.join(self.temp_dir, f"compress_q{q}.pdf")
+                c = rlcanvas.Canvas(tmpout, pagesize=A4)
+                pw, ph = A4
+
+                for pidx, img in enumerate(pages, start=1):
+                    bufname = os.path.join(self.temp_dir, f"page_{q}_{pidx}.jpg")
+                    img.save(bufname, format="JPEG", quality=q)
+                    pageimg = Image.open(bufname)
+                    iw, ih = pageimg.size
+                    scale = min(pw / iw, ph / ih)
+                    nw, nh = iw * scale, ih * scale
+                    x = (pw - nw) / 2
+                    y = (ph - nh) / 2
+                    c.drawImage(ImageReader(pageimg), x, y, width=nw, height=nh)
+                    c.showPage()
+                    try:
+                        os.remove(bufname)
+                    except Exception:
+                        pass
+
+                    progress = ((qidx - 1) * totalpages + pidx) / (totalpages * len(qualities)) * 100.0
+                    self.after(0, self.progress_var.set, progress)
+
+                c.save()
+                sz = os.path.getsize(tmpout)
+
+                if sz <= targetbytes:
+                    bestpath = tmpout
+                    bestsize = sz
+                    break
+
+                if bestpath is None or sz < bestsize:
+                    bestpath = tmpout
+                    bestsize = sz
+
+            if bestpath:
+                shutil.copy(bestpath, dstpdf)
+
+            def done():
+                if bestpath and os.path.exists(dstpdf):
+                    finalkb = os.path.getsize(dstpdf) / 1024
+                    self.status_text.set(f"Compressed PDF saved. Size {finalkb:.1f} KB.")
+                    messagebox.showinfo("Done", f"Compressed PDF saved.\nsize {finalkb:.1f} KB")
+                else:
+                    self.status_text.set("Compression failed.")
+                    messagebox.showerror("Error", "Could not compress PDF.")
+                self.progress_var.set(0)
+                self.wait_label.config(text="")
+
+            self.after(0, done)
+        except Exception as e:
+            def showerr():
+                self.progress_var.set(0)
+                self.wait_label.config(text="")
+                self.status_text.set("Error during compression.")
+                messagebox.showerror("Error", f"Compression failed:\n{e}")
+            self.after(0, showerr)
+
+    def export_to_pdf(self):
+        outputpath = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF Files", "*.pdf")], title="Save ATC as PDF")
+        if not outputpath:
+            return
+        if self.export_thread and self.export_thread.is_alive():
+            messagebox.showinfo("Export", "Export already running, please wait.")
+            return
+        self.progress.config(mode="determinate")
+        self.progress_var.set(0)
+        self.wait_label.config(text="Exporting PDF, please wait...")
+        self.status_text.set(f"Exporting to {outputpath} ...")
+        self.export_thread = Thread(target=self._export_worker, args=(outputpath,), daemon=True)
+        self.export_thread.start()
+
+    def _export_worker(self, outputfile):
+        try:
+            elems, _, frame_left, frame_width, frame_height = self.build_story_and_preview_source_map()
+            if not elems:
+                open(outputfile, "wb").close()
+            else:
+                frame_margin_bottom = self.page_margin_bottom + 120
+                frame = Frame(frame_left, frame_margin_bottom, frame_width, frame_height, id="bodyframe")
+                template = PageTemplate(id="gematc", frames=[frame], onPage=self.on_page)
+                doc = BaseDocTemplate(outputfile, pagesize=A4, pageTemplates=[template])
+                doc.build(elems)
+
+            def done():
+                self.progress_var.set(100)
+                self.wait_label.config(text="")
+                self.status_text.set(f"PDF exported {outputfile}")
+                messagebox.showinfo("Success", "PDF has been exported successfully.")
+
+            self.after(0, done)
+        except Exception as e:
+            def showerr():
+                self.status_text.set("Error exporting PDF.")
+                messagebox.showerror("Export Error", f"PDF export failed:\n{e}")
+                self.progress_var.set(0)
+                self.wait_label.config(text="")
+            self.after(0, showerr)
+
+
+if __name__ == "__main__":
+    app = GEMATCGenerator()
+    app.mainloop()
